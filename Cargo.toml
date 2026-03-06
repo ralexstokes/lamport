@@ -1,0 +1,23 @@
+[package]
+name = "lamport"
+version = "0.1.0"
+edition = "2024"
+description = "OTP-inspired actor runtime primitives for Rust"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "lamport"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[[bench]]
+name = "runtime_primitives"
+harness = false
