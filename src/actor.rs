@@ -39,7 +39,9 @@ pub trait Actor: Send + 'static {
     ///
     /// The default implementation preserves the runtime's existing delivery
     /// semantics. Actors that need selective receive can override this and use
-    /// the receive helpers on [`crate::Context`].
+    /// the receive helpers on [`crate::Context`]. Long-running wait states that
+    /// repeatedly scan or drain mail should pair those receive helpers with
+    /// [`crate::ActorContext::yield_now`] so concurrent schedulers can rotate.
     fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
         ctx.receive_next()
     }

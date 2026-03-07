@@ -508,6 +508,19 @@ The returned pending-call handle MUST include:
 
 Replies MUST be delivered as reply envelopes addressed to the original caller.
 
+Actors MUST also be able to arm a runtime-managed receive timeout for
+actor-selected receive loops.
+
+Receive-timeout helper semantics:
+
+- arm a fresh timer token managed by the runtime
+- allow selective receive to match either the user predicate or that timeout
+  token
+- cancel and withdraw the queued timeout envelope when a non-timeout envelope
+  wins first
+- leave timeout handling observable as an ordinary timer envelope carrying that
+  token
+
 ### 10.5 Link / Unlink
 
 Actors MUST be able to create and remove bidirectional links.
@@ -573,6 +586,10 @@ observable effect.
 
 The concurrent runtime profile MUST honor it by yielding scheduler time after
 the current turn.
+
+Actor code that stays in a selective-receive wait state across many turns
+SHOULD request voluntary yield periodically after making progress so large
+mailbox scans do not monopolize a scheduler.
 
 ### 10.11 Exit Self
 

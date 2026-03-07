@@ -60,8 +60,8 @@ pub use behaviour::{
 pub use concurrent::ConcurrentRuntime;
 pub use context::{
     ActorContext, BehaviourContextExt, Context, LifecycleContext, LinkError, MonitorError,
-    PendingCall, ReceivedEnvelope, SendError, SpawnError, SpawnOptions, SupervisorContext,
-    TaskHandle, TimerError,
+    PendingCall, ReceiveTimeout, ReceivedEnvelope, SendError, SpawnError, SpawnOptions,
+    SupervisorContext, TaskHandle, TimerError,
 };
 pub use control::{ControlError, ControlResult, StateSnapshot, TraceOptions};
 pub use envelope::{

@@ -489,13 +489,37 @@ impl RuntimeShared {
     }
 
     fn cancel_actor_timer(&self, actor: ActorId, token: TimerToken) -> bool {
-        let handle = {
-            let mut state = self.lock_state();
-            Self::actor_mut(&mut state, actor).and_then(|entry| entry.timer_tasks.remove(&token))
-        };
+        let mut cancelled = false;
 
-        if let Some(handle) = handle {
-            handle.abort();
+        {
+            let mut state = self.lock_state();
+            if let Some(handle) = Self::actor_mut(&mut state, actor)
+                .and_then(|entry| entry.timer_tasks.remove(&token))
+            {
+                handle.abort();
+                cancelled = true;
+            }
+
+            if let Some(entry) = Self::actor_mut(&mut state, actor) {
+                let removed = entry
+                    .mailbox
+                    .remove_matching(|envelope| matches!(
+                        envelope,
+                        Envelope::Timer(TimerFired { token: queued_token }) if *queued_token == token
+                    ))
+                    .is_some();
+                if removed {
+                    entry.metrics.mailbox_len = entry.mailbox.len();
+                }
+                cancelled |= removed;
+            }
+        }
+
+        if cancelled {
+            self.idle_cv.notify_all();
+        }
+
+        if cancelled {
             return true;
         }
 
@@ -2370,6 +2394,76 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ReceiveTimeoutMode {
+        MatchBeforeTimeout,
+        TimeoutWins,
+    }
+
+    struct ReceiveTimeoutActor {
+        mode: ReceiveTimeoutMode,
+        seen: Arc<Mutex<Vec<String>>>,
+        timeout: Option<crate::ReceiveTimeout>,
+    }
+
+    impl Actor for ReceiveTimeoutActor {
+        fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+            ctx.send(ctx.actor_id(), 7_u32)
+                .map_err(|error| ExitReason::Error(format!("self-send failed: {error:?}")))?;
+
+            if matches!(self.mode, ReceiveTimeoutMode::MatchBeforeTimeout) {
+                ctx.send(ctx.actor_id(), 42_u32)
+                    .map_err(|error| ExitReason::Error(format!("self-send failed: {error:?}")))?;
+            }
+
+            self.timeout = Some(
+                ctx.arm_receive_timeout(Duration::from_millis(15))
+                    .map_err(|error| {
+                        ExitReason::Error(format!("timeout setup failed: {error:?}"))
+                    })?,
+            );
+            Ok(())
+        }
+
+        fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+            if let Some(timeout) = self.timeout {
+                return ctx.receive_selective_with_timeout(timeout, |envelope| {
+                    matches!(
+                        envelope,
+                        Envelope::User(payload) if payload.downcast_ref::<u32>() == Some(&42)
+                    )
+                });
+            }
+
+            ctx.receive_next()
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            match envelope {
+                Envelope::User(payload) => {
+                    let value = payload.downcast::<u32>().ok().unwrap();
+                    if value == 42 {
+                        self.timeout = None;
+                        self.seen.lock().unwrap().push("matched:42".into());
+                    } else {
+                        self.seen.lock().unwrap().push(format!("user:{value}"));
+                    }
+                }
+                Envelope::Timer(timer)
+                    if self
+                        .timeout
+                        .is_some_and(|timeout| timeout.token() == timer.token) =>
+                {
+                    self.timeout = None;
+                    self.seen.lock().unwrap().push("timeout".into());
+                }
+                other => panic!("unexpected envelope: {other:?}"),
+            }
+
+            ActorTurn::Continue
+        }
+    }
+
     struct SelectiveExitActor {
         target: crate::ActorId,
         seen: Arc<Mutex<Vec<String>>>,
@@ -2581,6 +2675,51 @@ mod tests {
         }
 
         assert_eq!(seen.lock().unwrap().as_slice(), &["reply:42", "user:7"]);
+    }
+
+    #[test]
+    fn selective_receive_timeout_fires_without_losing_older_mail() {
+        let runtime = ConcurrentRuntime::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        runtime
+            .spawn(ReceiveTimeoutActor {
+                mode: ReceiveTimeoutMode::TimeoutWins,
+                seen: Arc::clone(&seen),
+                timeout: None,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["timeout", "user:7"]);
+    }
+
+    #[test]
+    fn selective_receive_timeout_is_cancelled_after_match() {
+        let runtime = ConcurrentRuntime::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        runtime
+            .spawn(ReceiveTimeoutActor {
+                mode: ReceiveTimeoutMode::MatchBeforeTimeout,
+                seen: Arc::clone(&seen),
+                timeout: None,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["matched:42", "user:7"]);
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(seen.lock().unwrap().as_slice(), &["matched:42", "user:7"]);
     }
 
     #[test]

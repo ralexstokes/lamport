@@ -74,9 +74,37 @@ impl ReceivedEnvelope {
         Self(envelope)
     }
 
+    /// Borrows the claimed envelope without consuming it.
+    pub fn as_envelope(&self) -> &Envelope {
+        &self.0
+    }
+
     /// Consumes the claimed envelope so the runtime can deliver it to `handle`.
     pub fn into_envelope(self) -> Envelope {
         self.0
+    }
+}
+
+/// Runtime-managed timeout token for selective-receive wait states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceiveTimeout {
+    token: TimerToken,
+}
+
+impl ReceiveTimeout {
+    /// Creates a receive-timeout handle from a timer token.
+    pub const fn new(token: TimerToken) -> Self {
+        Self { token }
+    }
+
+    /// Returns the underlying timer token.
+    pub const fn token(self) -> TimerToken {
+        self.token
+    }
+
+    /// Returns `true` when the envelope is this timeout firing.
+    pub fn matches(self, envelope: &Envelope) -> bool {
+        matches!(envelope, Envelope::Timer(timer) if timer.token == self.token)
     }
 }
 
@@ -219,6 +247,39 @@ pub trait ActorContext {
     where
         F: FnMut(&Envelope) -> bool;
 
+    /// Claims the next envelope or a runtime-managed timeout firing.
+    ///
+    /// This helper is non-blocking. It returns `None` until either a mailbox
+    /// envelope or the timeout token is available for the current turn.
+    ///
+    /// When the timeout fires, the returned envelope is `Envelope::Timer` with
+    /// the same token stored in `timeout`.
+    fn receive_next_with_timeout(&mut self, timeout: ReceiveTimeout) -> Option<ReceivedEnvelope> {
+        self.receive_selective_with_timeout(timeout, |_| true)
+    }
+
+    /// Claims a mailbox envelope that matches the predicate or a timeout firing.
+    ///
+    /// The timeout is automatically cancelled when a non-timeout envelope wins.
+    /// For wait loops that repeatedly scan large mailboxes, call `yield_now()`
+    /// from `handle` after making progress so concurrent schedulers can rotate.
+    fn receive_selective_with_timeout<F>(
+        &mut self,
+        timeout: ReceiveTimeout,
+        mut predicate: F,
+    ) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        let envelope =
+            self.receive_selective(|envelope| timeout.matches(envelope) || predicate(envelope))?;
+
+        if !timeout.matches(envelope.as_envelope()) {
+            let _ = self.cancel_receive_timeout(timeout);
+        }
+        Some(envelope)
+    }
+
     /// Claims a matching envelope whose mailbox sequence is at or after the watermark.
     ///
     /// Reserved runtime traffic may bypass the predicate so actors cannot hide
@@ -251,7 +312,22 @@ pub trait ActorContext {
     fn schedule_after(&mut self, delay: Duration, token: TimerToken) -> Result<(), TimerError>;
 
     /// Cancels a previously scheduled timer.
+    ///
+    /// If the timer already fired but its mailbox envelope has not been
+    /// observed yet, the runtime withdraws that queued timer envelope.
     fn cancel_timer(&mut self, token: TimerToken) -> bool;
+
+    /// Arms a runtime-managed timeout for a selective-receive wait state.
+    fn arm_receive_timeout(&mut self, delay: Duration) -> Result<ReceiveTimeout, TimerError> {
+        let timeout = ReceiveTimeout::new(TimerToken::next());
+        self.schedule_after(delay, timeout.token())?;
+        Ok(timeout)
+    }
+
+    /// Cancels a runtime-managed receive timeout.
+    fn cancel_receive_timeout(&mut self, timeout: ReceiveTimeout) -> bool {
+        self.cancel_timer(timeout.token())
+    }
 
     /// Dispatches blocking I/O work onto a dedicated pool.
     ///

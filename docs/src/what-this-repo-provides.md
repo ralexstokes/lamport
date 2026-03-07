@@ -34,6 +34,8 @@ This model gives you:
 
 - stable `ActorId`s for live actors
 - bounded mailboxes
+- actor-selected receive with selective receive, mailbox watermarks, and
+  receive-timeout helpers
 - request/reply with reply tokens and optional timeouts
 - timers keyed by `TimerToken`
 - links, monitors, and trap-exit semantics
@@ -42,7 +44,9 @@ This model gives you:
 The turn contract is intentionally synchronous. If you need slow I/O or CPU
 work, dispatch it through `Context::spawn_blocking_io` or
 `Context::spawn_blocking_cpu` and handle completion as a later runtime info
-message.
+message. If you keep an actor in a selective-receive wait loop for many turns,
+call `Context::yield_now()` after making progress so concurrent schedulers can
+rotate fairly.
 
 ## Higher-Level Behaviours
 
