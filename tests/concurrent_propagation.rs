@@ -1,13 +1,15 @@
 use std::{
     sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+mod support;
 
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, ConcurrentRuntime, Context, DownMessage, Envelope,
     ExitReason, SchedulerConfig, SpawnOptions,
 };
+use support::wait_until_concurrent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
@@ -154,23 +156,20 @@ fn concurrent_runtime_propagates_links_and_monitors_under_load() {
 
     let expected_trapped = TARGETS * TRAPPERS_PER_TARGET;
     let expected_down = TARGETS * MONITORS_PER_TARGET;
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    while Instant::now() < deadline {
-        if trapped.lock().unwrap().len() == expected_trapped
-            && down.lock().unwrap().len() == expected_down
-            && linked.iter().all(|actor| {
-                runtime
-                    .actor_snapshot(*actor)
-                    .is_some_and(|snapshot| snapshot.status == ActorStatus::Dead)
-            })
-        {
-            break;
-        }
-
-        let _ = runtime.wait_for_idle(Some(Duration::from_millis(50)));
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_until_concurrent(
+        &runtime,
+        Duration::from_secs(5),
+        "linked and monitored concurrent shutdown propagation",
+        |runtime| {
+            trapped.lock().unwrap().len() == expected_trapped
+                && down.lock().unwrap().len() == expected_down
+                && linked.iter().all(|actor| {
+                    runtime
+                        .actor_snapshot(*actor)
+                        .is_some_and(|snapshot| snapshot.status == ActorStatus::Dead)
+                })
+        },
+    );
 
     let trapped = trapped.lock().unwrap().clone();
     let down = down.lock().unwrap().clone();

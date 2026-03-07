@@ -5,6 +5,38 @@ use crate::{
 
 use super::{RuntimeEvent, RuntimeEventKind};
 
+macro_rules! emit_actor_exit {
+    ($level:expr, $sequence:expr, $actor:expr, $name:expr, $reason:expr, $parent:expr, $ancestors:expr) => {
+        tracing::event!(
+            target: "lamport.lifecycle",
+            $level,
+            sequence = $sequence,
+            actor_id = %$actor,
+            actor_name = *$name,
+            reason = %$reason,
+            parent = ?$parent,
+            ancestors = ?$ancestors,
+            "actor exited"
+        )
+    };
+}
+
+macro_rules! emit_shutdown_update {
+    ($level:expr, $sequence:expr, $requester:expr, $actor:expr, $policy:expr, $phase:expr, $reason:expr) => {
+        tracing::event!(
+            target: "lamport.lifecycle",
+            $level,
+            sequence = $sequence,
+            requester = %$requester,
+            actor_id = %$actor,
+            policy = ?$policy,
+            phase = ?$phase,
+            reason = ?$reason,
+            "actor shutdown lifecycle update"
+        )
+    };
+}
+
 pub(crate) fn emit_tracing_event(record: &RuntimeEvent) {
     match &record.kind {
         RuntimeEventKind::Lifecycle(event) => emit_lifecycle_event(record, event),
@@ -106,28 +138,24 @@ fn emit_exit(
     ancestors: &[crate::types::ActorId],
 ) {
     if matches!(reason, ExitReason::Normal | ExitReason::Shutdown) {
-        tracing::event!(
-            target: "lamport.lifecycle",
+        emit_actor_exit!(
             tracing::Level::INFO,
             sequence,
-            actor_id = %actor,
-            actor_name = *name,
-            reason = %reason,
-            parent = ?parent,
-            ancestors = ?ancestors,
-            "actor exited"
+            actor,
+            name,
+            reason,
+            parent,
+            ancestors
         );
     } else {
-        tracing::event!(
-            target: "lamport.lifecycle",
+        emit_actor_exit!(
             tracing::Level::WARN,
             sequence,
-            actor_id = %actor,
-            actor_name = *name,
-            reason = %reason,
-            parent = ?parent,
-            ancestors = ?ancestors,
-            "actor exited"
+            actor,
+            name,
+            reason,
+            parent,
+            ancestors
         );
     }
 }
@@ -141,31 +169,23 @@ fn emit_shutdown(
     reason: &Option<ExitReason>,
 ) {
     match phase {
-        ShutdownPhase::TimedOut => {
-            tracing::event!(
-                target: "lamport.lifecycle",
-                tracing::Level::WARN,
-                sequence,
-                requester = %requester,
-                actor_id = %actor,
-                policy = ?policy,
-                phase = ?phase,
-                reason = ?reason,
-                "actor shutdown lifecycle update"
-            );
-        }
-        ShutdownPhase::Requested | ShutdownPhase::Completed => {
-            tracing::event!(
-                target: "lamport.lifecycle",
-                tracing::Level::INFO,
-                sequence,
-                requester = %requester,
-                actor_id = %actor,
-                policy = ?policy,
-                phase = ?phase,
-                reason = ?reason,
-                "actor shutdown lifecycle update"
-            );
-        }
+        ShutdownPhase::TimedOut => emit_shutdown_update!(
+            tracing::Level::WARN,
+            sequence,
+            requester,
+            actor,
+            policy,
+            phase,
+            reason
+        ),
+        ShutdownPhase::Requested | ShutdownPhase::Completed => emit_shutdown_update!(
+            tracing::Level::INFO,
+            sequence,
+            requester,
+            actor,
+            policy,
+            phase,
+            reason
+        ),
     }
 }

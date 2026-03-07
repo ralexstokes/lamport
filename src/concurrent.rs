@@ -3,7 +3,7 @@ mod worker;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -20,12 +20,10 @@ use crate::{
         ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
         SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
-    envelope::{
-        DownMessage, Envelope, ExitSignal, Message, Payload, ReplyToken, TaskCompleted, TimerFired,
-    },
+    envelope::{DownMessage, Envelope, Message, Payload, ReplyToken, TaskCompleted, TimerFired},
     internal::{
-        ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason,
-        normalize_scheduler_config,
+        ShutdownMode, ShutdownTracker, SupervisorRuntimeState, TurnEffects, actor_mailbox,
+        mailbox_overflow_reason, normalize_scheduler_config, shutdown_signal,
     },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull},
@@ -99,20 +97,11 @@ impl ActorRecord {
         config: &SchedulerConfig,
         scheduler_id: usize,
     ) -> Self {
-        let mailbox_capacity = options
-            .mailbox_capacity
-            .unwrap_or(config.default_mailbox_capacity);
-
         Self {
             id,
             name,
             notify: Arc::new(Notify::new()),
-            mailbox: Mailbox::with_limits(
-                mailbox_capacity,
-                config
-                    .mailbox_runtime_reserve
-                    .min(mailbox_capacity.saturating_sub(1)),
-            ),
+            mailbox: actor_mailbox(config, options.mailbox_capacity),
             links: BTreeSet::new(),
             monitors_in: BTreeMap::new(),
             monitors_out: BTreeMap::new(),
@@ -207,8 +196,10 @@ impl RuntimeShared {
         })
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
-        self.state.lock().expect("runtime state poisoned")
+    fn lock_state(&self) -> MutexGuard<'_, RuntimeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn allocate_id(state: &mut RuntimeState) -> ActorId {
@@ -654,24 +645,20 @@ impl ConcurrentContext {
         self.effects
     }
 
-    fn actor_record<F, R>(&self, op: F) -> R
+    fn actor_record<F, R>(&self, op: F) -> Option<R>
     where
         F: FnOnce(&ActorRecord) -> R,
     {
         let state = self.runtime.lock_state();
-        let actor = RuntimeShared::actor_ref(&state, self.actor_id)
-            .expect("current actor must exist while running");
-        op(actor)
+        RuntimeShared::actor_ref(&state, self.actor_id).map(op)
     }
 
-    fn actor_record_mut<F, R>(&self, op: F) -> R
+    fn actor_record_mut<F, R>(&self, op: F) -> Option<R>
     where
         F: FnOnce(&mut ActorRecord) -> R,
     {
         let mut state = self.runtime.lock_state();
-        let actor = RuntimeShared::actor_mut(&mut state, self.actor_id)
-            .expect("current actor must exist while running");
-        op(actor)
+        RuntimeShared::actor_mut(&mut state, self.actor_id).map(op)
     }
 
     fn send_to(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
@@ -679,11 +666,14 @@ impl ConcurrentContext {
     }
 
     fn enqueue_self_runtime_envelope(&mut self, envelope: Envelope, label: &'static str) {
-        let result = self.actor_record_mut(|actor| push_envelope(actor, envelope));
+        let result = self
+            .actor_record_mut(|actor| push_envelope(actor, envelope))
+            .unwrap_or(Err(SendError::NoProc(self.actor_id)));
         match result {
             Ok(()) => {
-                let notify = self.actor_record(|actor| Arc::clone(&actor.notify));
-                notify.notify_one();
+                if let Some(notify) = self.actor_record(|actor| Arc::clone(&actor.notify)) {
+                    notify.notify_one();
+                }
             }
             Err(SendError::MailboxFull { .. }) => {
                 self.effects.exit_reason = Some(mailbox_overflow_reason(self.actor_id, label));
@@ -702,7 +692,14 @@ impl ConcurrentContext {
         }
 
         if options.ancestors.is_empty() {
-            let ancestors = self.actor_record(|actor| actor.ancestors.clone());
+            let ancestors = self
+                .actor_record(|actor| actor.ancestors.clone())
+                .ok_or_else(|| {
+                    SpawnError::InitFailed(ExitReason::Error(format!(
+                        "actor `{}` no longer exists while spawning child",
+                        self.actor_id
+                    )))
+                })?;
             options.ancestors = ancestors;
             options.ancestors.push(self.actor_id);
         }
@@ -723,19 +720,21 @@ impl ConcurrentContext {
             return Err(LinkError::NoProc(other));
         }
 
-        let current = state
-            .actors
-            .get_mut(&self.actor_id.local_id)
-            .expect("current actor must exist");
-        if !current.links.insert(other) {
-            return Err(LinkError::AlreadyLinked(other));
+        {
+            let Some(current) = RuntimeShared::actor_mut(&mut state, self.actor_id) else {
+                return Err(LinkError::NoProc(self.actor_id));
+            };
+            if !current.links.insert(other) {
+                return Err(LinkError::AlreadyLinked(other));
+            }
         }
-        state
-            .actors
-            .get_mut(&other.local_id)
-            .expect("target actor must exist")
-            .links
-            .insert(self.actor_id);
+        let Some(target) = RuntimeShared::actor_mut(&mut state, other) else {
+            if let Some(current) = RuntimeShared::actor_mut(&mut state, self.actor_id) {
+                current.links.remove(&other);
+            }
+            return Err(LinkError::NoProc(other));
+        };
+        target.links.insert(self.actor_id);
         Ok(())
     }
 
@@ -752,22 +751,17 @@ impl ConcurrentContext {
             return Err(LinkError::NoProc(other));
         }
 
-        if !state
-            .actors
-            .get_mut(&self.actor_id.local_id)
-            .expect("current actor must exist")
-            .links
-            .remove(&other)
-        {
+        let Some(current) = RuntimeShared::actor_mut(&mut state, self.actor_id) else {
+            return Err(LinkError::NoProc(self.actor_id));
+        };
+        if !current.links.remove(&other) {
             return Err(LinkError::NotLinked(other));
         }
 
-        state
-            .actors
-            .get_mut(&other.local_id)
-            .expect("target actor must exist")
-            .links
-            .remove(&self.actor_id);
+        let Some(target) = RuntimeShared::actor_mut(&mut state, other) else {
+            return Err(LinkError::NoProc(other));
+        };
+        target.links.remove(&self.actor_id);
         Ok(())
     }
 
@@ -787,18 +781,13 @@ impl ConcurrentContext {
             .get(&other.local_id)
             .is_some_and(|entry| entry.id == other)
         {
-            state
-                .actors
-                .get_mut(&self.actor_id.local_id)
-                .expect("current actor must exist")
-                .monitors_out
-                .insert(reference, other);
-            state
-                .actors
-                .get_mut(&other.local_id)
-                .expect("target actor must exist")
-                .monitors_in
-                .insert(reference, self.actor_id);
+            let Some(current) = RuntimeShared::actor_mut(&mut state, self.actor_id) else {
+                return reference;
+            };
+            current.monitors_out.insert(reference, other);
+            if let Some(target) = RuntimeShared::actor_mut(&mut state, other) {
+                target.monitors_in.insert(reference, self.actor_id);
+            }
         } else {
             drop(state);
             self.enqueue_self_runtime_envelope(
@@ -900,7 +889,7 @@ impl ActorContext for ConcurrentContext {
     }
 
     fn scheduler_id(&self) -> Option<usize> {
-        Some(self.actor_record(|actor| actor.scheduler_id))
+        self.actor_record(|actor| actor.scheduler_id)
     }
 
     fn spawn<A: Actor>(&mut self, actor: A, options: SpawnOptions) -> Result<ActorId, SpawnError> {
@@ -931,7 +920,9 @@ impl ActorContext for ConcurrentContext {
     ) -> Result<PendingCall, SendError> {
         let reference = Ref::next();
         let reply_to = ReplyToken::new(self.actor_id, reference);
-        let watermark = self.actor_record(|actor| actor.mailbox.watermark());
+        let Some(watermark) = self.actor_record(|actor| actor.mailbox.watermark()) else {
+            return Err(SendError::NoProc(self.actor_id));
+        };
         self.send_to(to, Envelope::request(reply_to, message))?;
         if let Some(timeout) = timeout {
             self.runtime
@@ -957,7 +948,7 @@ impl ActorContext for ConcurrentContext {
     }
 
     fn set_trap_exit(&mut self, enabled: bool) {
-        self.actor_record_mut(|actor| actor.trap_exit = enabled);
+        let _ = self.actor_record_mut(|actor| actor.trap_exit = enabled);
     }
 
     fn schedule_after(&mut self, delay: Duration, token: TimerToken) -> Result<(), TimerError> {
@@ -1005,9 +996,7 @@ impl ActorContext for ConcurrentContext {
             }
 
             let prior = RuntimeShared::actor_mut(&mut state, actor)
-                .expect("target actor must exist")
-                .shutdown
-                .take();
+                .and_then(|target| target.shutdown.take());
             if let Some(mut tracker) = prior
                 && let Some(task) = tracker.task.take()
             {
@@ -1025,34 +1014,27 @@ impl ActorContext for ConcurrentContext {
                 },
             );
 
-            let task = match policy.clone() {
-                Shutdown::BrutalKill => None,
-                Shutdown::Timeout(delay) => Some(self.runtime.spawn_shutdown_timeout(actor, delay)),
-                Shutdown::Infinity => None,
+            let task = match ShutdownMode::from_policy(&policy) {
+                ShutdownMode::ForceKill => None,
+                ShutdownMode::Linked {
+                    timeout: Some(delay),
+                } => Some(self.runtime.spawn_shutdown_timeout(actor, delay)),
+                ShutdownMode::Linked { timeout: None } => None,
             };
 
-            RuntimeShared::actor_mut(&mut state, actor)
-                .expect("target actor must exist")
-                .shutdown = Some(ShutdownTracker {
-                requester: self.actor_id,
-                policy: policy.clone(),
-                task,
-            });
+            let Some(target) = RuntimeShared::actor_mut(&mut state, actor) else {
+                return Err(SendError::NoProc(actor));
+            };
+            target.shutdown = Some(ShutdownTracker::new(self.actor_id, policy.clone(), task));
         }
 
-        match policy {
-            Shutdown::BrutalKill => {
+        match ShutdownMode::from_policy(&policy) {
+            ShutdownMode::ForceKill => {
                 self.runtime.request_force_exit(actor, ExitReason::Kill);
             }
-            Shutdown::Timeout(_) | Shutdown::Infinity => {
-                self.runtime.propagate_link_exit(
-                    actor,
-                    ExitSignal {
-                        from: self.actor_id,
-                        reason: ExitReason::Shutdown,
-                        linked: true,
-                    },
-                );
+            ShutdownMode::Linked { .. } => {
+                self.runtime
+                    .propagate_link_exit(actor, shutdown_signal(self.actor_id));
             }
         }
 
@@ -1080,10 +1062,11 @@ impl SupervisorContext for ConcurrentContext {
 
             allowed
         })
+        .unwrap_or(false)
     }
 
     fn supervisor_child_started(&mut self, child_id: &'static str, actor: ActorId) {
-        self.actor_record_mut(|current| {
+        let _ = self.actor_record_mut(|current| {
             if let Some(supervisor) = current.supervisor.as_mut() {
                 supervisor.set_running(child_id, actor);
             }
@@ -1091,7 +1074,7 @@ impl SupervisorContext for ConcurrentContext {
     }
 
     fn supervisor_child_exited(&mut self, child_id: &'static str, actor: ActorId) {
-        self.actor_record_mut(|current| {
+        let _ = self.actor_record_mut(|current| {
             if let Some(supervisor) = current.supervisor.as_mut() {
                 supervisor.clear_running(child_id, actor);
             }
@@ -1110,9 +1093,7 @@ fn push_envelope(state: &mut ActorRecord, envelope: Envelope) -> Result<(), Send
     let MailboxFull { capacity } = match state.mailbox.try_push(envelope) {
         Ok(()) => {
             state.metrics.mailbox_len = state.mailbox.len();
-            if !matches!(state.status, ActorStatus::Dead | ActorStatus::Exiting)
-                && matches!(state.status, ActorStatus::Waiting)
-            {
+            if matches!(state.status, ActorStatus::Waiting) {
                 state.status = ActorStatus::Runnable;
             }
             return Ok(());
@@ -1406,22 +1387,21 @@ impl ConcurrentRuntime {
                         return false;
                     }
                     let remaining = timeout.saturating_sub(elapsed);
-                    let (next_state, wait) = self
-                        .inner
-                        .idle_cv
-                        .wait_timeout(state, remaining)
-                        .expect("runtime state poisoned");
+                    let (next_state, wait) = match self.inner.idle_cv.wait_timeout(state, remaining)
+                    {
+                        Ok(result) => result,
+                        Err(poison) => poison.into_inner(),
+                    };
                     state = next_state;
                     if wait.timed_out() {
                         return RuntimeShared::is_idle_state(&state);
                     }
                 }
                 None => {
-                    state = self
-                        .inner
-                        .idle_cv
-                        .wait(state)
-                        .expect("runtime state poisoned");
+                    state = match self.inner.idle_cv.wait(state) {
+                        Ok(next_state) => next_state,
+                        Err(poison) => poison.into_inner(),
+                    };
                 }
             }
         }
@@ -1530,11 +1510,11 @@ impl Scheduler for ConcurrentRuntime {
     }
 
     fn run_queue_snapshots(&self) -> Vec<RunQueueSnapshot> {
-        self.run_queue_snapshots()
+        ConcurrentRuntime::run_queue_snapshots(self)
     }
 
     fn metrics(&self) -> SchedulerMetrics {
-        self.metrics()
+        ConcurrentRuntime::metrics(self)
     }
 }
 

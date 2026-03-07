@@ -1,4 +1,7 @@
+mod support;
+
 use lamport::{Envelope, mailbox::Mailbox};
+use support::expect_downcast;
 
 #[derive(Clone, Copy)]
 struct Lcg(u64);
@@ -27,7 +30,7 @@ impl Lcg {
 
 fn envelope_u32(envelope: Envelope) -> u32 {
     match envelope {
-        Envelope::User(payload) => payload.downcast::<u32>().ok().unwrap(),
+        Envelope::User(payload) => expect_downcast::<u32>(payload, "mailbox property payload"),
         other => panic!("unexpected envelope: {other:?}"),
     }
 }

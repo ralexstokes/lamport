@@ -3,12 +3,15 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+mod support;
+
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec,
     Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome,
     Shutdown, SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective,
     SupervisorFlags, behaviour::RuntimeInfo, boot_local_application, restart_scope,
 };
+use support::expect_downcast;
 
 const ROOT_NAME: &str = "integration.root";
 const WORKER_NAME: &str = "integration.worker";
@@ -89,7 +92,7 @@ impl Actor for ClientActor {
             self.seen
                 .lock()
                 .unwrap()
-                .push(message.downcast::<usize>().expect("generation reply"));
+                .push(expect_downcast::<usize>(message, "generation reply"));
         }
 
         ActorTurn::Continue

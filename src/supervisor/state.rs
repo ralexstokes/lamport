@@ -25,6 +25,11 @@ pub(super) struct RestartPlan {
     pub(super) old_children: BTreeMap<&'static str, Option<ActorId>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RestartPlanError {
+    UnexpectedChild(&'static str),
+}
+
 #[derive(Debug)]
 pub(super) struct ShutdownPlan {
     pub(super) active_child: Option<&'static str>,
@@ -95,7 +100,10 @@ impl SupervisorActorState {
 }
 
 impl RestartPlan {
-    pub(super) fn complete_shutdown(&mut self, child_id: &'static str) -> Result<(), ()> {
+    pub(super) fn complete_shutdown(
+        &mut self,
+        child_id: &'static str,
+    ) -> Result<(), RestartPlanError> {
         if self.active_shutdown == Some(child_id) {
             self.active_shutdown = None;
             return Ok(());
@@ -110,7 +118,7 @@ impl RestartPlan {
             return Ok(());
         }
 
-        Err(())
+        Err(RestartPlanError::UnexpectedChild(child_id))
     }
 
     pub(super) fn next_shutdown(&mut self) -> Option<&'static str> {

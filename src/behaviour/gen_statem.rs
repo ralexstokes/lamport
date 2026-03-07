@@ -9,6 +9,7 @@ use super::{
     RuntimeInfo,
     adapter::{
         DispatchEnvelope, UserMessage, classify_envelope, downcast_payload, downcast_user_message,
+        initialized_pair,
     },
 };
 
@@ -145,19 +146,16 @@ where
         }
     }
 
-    fn machine_state_and_data_mut(&mut self) -> (&mut G, &mut G::State, &mut G::Data) {
+    fn machine_state_and_data_mut(
+        &mut self,
+    ) -> Result<(&mut G, &mut G::State, &mut G::Data), ActorTurn> {
         let Self {
             machine,
             state,
             data,
         } = self;
-        let state = state
-            .as_mut()
-            .expect("gen statem state must be initialized before handling messages");
-        let data = data
-            .as_mut()
-            .expect("gen statem data must be initialized before handling messages");
-        (machine, state, data)
+        let (state, data) = initialized_pair(state, data, "gen statem state", "gen statem data")?;
+        Ok((machine, state, data))
     }
 
     fn handle_call<C: Context>(
@@ -171,7 +169,10 @@ where
             Err(turn) => return turn,
         };
 
-        let (machine, state, data) = self.machine_state_and_data_mut();
+        let (machine, state, data) = match self.machine_state_and_data_mut() {
+            Ok(parts) => parts,
+            Err(turn) => return turn,
+        };
         match machine.handle_call(state, data, token, call, ctx) {
             StatemCallOutcome::Reply(reply) => {
                 let _ = ctx.reply(token, reply);
@@ -198,12 +199,18 @@ where
     fn handle_user<C: Context>(&mut self, payload: Payload, ctx: &mut C) -> ActorTurn {
         match downcast_user_message::<G::Cast, G::Info>(payload, "statem") {
             Ok(UserMessage::Cast(message)) => {
-                let (machine, state, data) = self.machine_state_and_data_mut();
+                let (machine, state, data) = match self.machine_state_and_data_mut() {
+                    Ok(parts) => parts,
+                    Err(turn) => return turn,
+                };
                 let outcome = machine.handle_cast(state, data, message, ctx);
                 map_statem_outcome(state, outcome)
             }
             Ok(UserMessage::Info(message)) => {
-                let (machine, state, data) = self.machine_state_and_data_mut();
+                let (machine, state, data) = match self.machine_state_and_data_mut() {
+                    Ok(parts) => parts,
+                    Err(turn) => return turn,
+                };
                 let outcome = machine.handle_info(state, data, message, ctx);
                 map_statem_outcome(state, outcome)
             }
@@ -212,7 +219,10 @@ where
     }
 
     fn handle_runtime_info<C: Context>(&mut self, info: RuntimeInfo, ctx: &mut C) -> ActorTurn {
-        let (machine, state, data) = self.machine_state_and_data_mut();
+        let (machine, state, data) = match self.machine_state_and_data_mut() {
+            Ok(parts) => parts,
+            Err(turn) => return turn,
+        };
         let outcome = machine.handle_info(state, data, G::Info::from(info), ctx);
         map_statem_outcome(state, outcome)
     }

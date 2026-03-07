@@ -145,8 +145,11 @@ fn run_init(
 ) -> Option<ExitReason> {
     let (name, scheduler_id) = {
         let mut state = runtime.lock_state();
-        let entry =
-            RuntimeShared::actor_mut(&mut state, actor_id).expect("actor must exist during init");
+        let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) else {
+            return Some(ExitReason::Error(format!(
+                "actor `{actor_id}` disappeared before init"
+            )));
+        };
         entry.status = ActorStatus::Running;
         entry.metrics.scheduler_id = Some(entry.scheduler_id);
         (entry.name, entry.scheduler_id)
@@ -196,8 +199,9 @@ async fn finish_actor_task(
 ) {
     let name = {
         let mut state = runtime.lock_state();
-        let entry = RuntimeShared::actor_mut(&mut state, actor_id)
-            .expect("actor must exist during termination");
+        let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) else {
+            return;
+        };
         entry.status = ActorStatus::Exiting;
         entry.metrics.scheduler_id = Some(entry.scheduler_id);
         entry.name

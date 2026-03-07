@@ -3,7 +3,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::{
     context::SendError,
     envelope::{DownMessage, Envelope, ExitSignal},
-    internal::{ExitDisposition, classify_exit_signal, mailbox_overflow_reason, panic_reason},
+    internal::{
+        ExitDisposition, classify_exit_signal, mailbox_overflow_reason, panic_reason,
+        shutdown_link_reason,
+    },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     types::{ActorId, ActorStatus, ExitReason, Ref},
 };
@@ -116,13 +119,8 @@ impl LocalRuntime {
             .iter()
             .map(|(reference, target)| (*reference, *target))
             .collect();
-        let linked_reason = if self.shutdown_tasks.contains_key(&actor_id)
-            && matches!(final_reason, ExitReason::Kill)
-        {
-            ExitReason::Shutdown
-        } else {
-            final_reason.clone()
-        };
+        let linked_reason =
+            shutdown_link_reason(self.shutdown_tasks.contains_key(&actor_id), &final_reason);
 
         if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
             && let Some(parent_state) = self.actor_state_mut(parent)

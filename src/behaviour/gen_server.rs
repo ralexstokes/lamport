@@ -9,6 +9,7 @@ use super::{
     RuntimeInfo,
     adapter::{
         DispatchEnvelope, UserMessage, classify_envelope, downcast_payload, downcast_user_message,
+        initialized_state,
     },
 };
 
@@ -125,12 +126,10 @@ where
         }
     }
 
-    fn server_and_state_mut(&mut self) -> (&mut G, &mut G::State) {
+    fn server_and_state_mut(&mut self) -> Result<(&mut G, &mut G::State), ActorTurn> {
         let Self { server, state } = self;
-        let state = state
-            .as_mut()
-            .expect("gen server state must be initialized before handling messages");
-        (server, state)
+        let state = initialized_state(state, "gen server state")?;
+        Ok((server, state))
     }
 
     fn handle_call<C: Context>(
@@ -144,7 +143,10 @@ where
             Err(turn) => return turn,
         };
 
-        let (server, state) = self.server_and_state_mut();
+        let (server, state) = match self.server_and_state_mut() {
+            Ok(parts) => parts,
+            Err(turn) => return turn,
+        };
         match server.handle_call(state, token, call, ctx) {
             CallOutcome::Reply(reply) => {
                 let _ = ctx.reply(token, reply);
@@ -162,11 +164,17 @@ where
     fn handle_user<C: Context>(&mut self, payload: Payload, ctx: &mut C) -> ActorTurn {
         match downcast_user_message::<G::Cast, G::Info>(payload, "server") {
             Ok(UserMessage::Cast(message)) => {
-                let (server, state) = self.server_and_state_mut();
+                let (server, state) = match self.server_and_state_mut() {
+                    Ok(parts) => parts,
+                    Err(turn) => return turn,
+                };
                 map_server_outcome(server.handle_cast(state, message, ctx))
             }
             Ok(UserMessage::Info(message)) => {
-                let (server, state) = self.server_and_state_mut();
+                let (server, state) = match self.server_and_state_mut() {
+                    Ok(parts) => parts,
+                    Err(turn) => return turn,
+                };
                 map_server_outcome(server.handle_info(state, message, ctx))
             }
             Err(turn) => turn,
@@ -174,7 +182,10 @@ where
     }
 
     fn handle_runtime_info<C: Context>(&mut self, info: RuntimeInfo, ctx: &mut C) -> ActorTurn {
-        let (server, state) = self.server_and_state_mut();
+        let (server, state) = match self.server_and_state_mut() {
+            Ok(parts) => parts,
+            Err(turn) => return turn,
+        };
         map_server_outcome(server.handle_info(state, G::Info::from(info), ctx))
     }
 }

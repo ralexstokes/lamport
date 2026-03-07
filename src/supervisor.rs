@@ -16,7 +16,7 @@ use crate::{
 
 use self::{
     child_context::SupervisorChildContext,
-    state::{RestartPlan, ShutdownPlan, SupervisorAction, SupervisorActorState},
+    state::{RestartPlan, RestartPlanError, ShutdownPlan, SupervisorAction, SupervisorActorState},
 };
 
 /// Failure to start a child from a supervisor.
@@ -26,6 +26,8 @@ pub enum StartChildError {
     SpawnRejected,
     /// The child is already running.
     AlreadyStarted(&'static str),
+    /// The requested child spec does not exist.
+    UnknownChild(&'static str),
     /// The child failed during initialization.
     InitFailed(ExitReason),
 }
@@ -94,10 +96,11 @@ impl<S: Supervisor> Actor for SupervisorActor<S> {
         ctx.set_trap_exit(true);
         ctx.configure_supervisor(self.state.flags, self.state.specs.clone());
 
-        for spec in self.state.specs.clone() {
-            if let Err(error) = self.start_child(spec.id, ctx) {
+        let child_ids: Vec<_> = self.state.specs.iter().map(|spec| spec.id).collect();
+        for child_id in child_ids {
+            if let Err(error) = self.start_child(child_id, ctx) {
                 self.abort_startup(ctx);
-                return Err(start_child_failure(&spec, error));
+                return Err(start_child_failure(child_id, error));
             }
         }
 
@@ -144,11 +147,11 @@ impl<S: Supervisor> SupervisorActor<S> {
             Some(SupervisorAction::Shutdown(plan)) => self.advance_shutdown(plan, child_id, ctx),
             Some(SupervisorAction::Restart(plan)) => self.advance_restart(plan, child_id, ctx),
             None => {
-                let spec = self
-                    .state
-                    .spec(child_id)
-                    .cloned()
-                    .expect("child spec must exist for tracked child");
+                let spec = self.state.spec(child_id).cloned();
+                let Some(spec) = spec else {
+                    return self
+                        .begin_shutdown(missing_child_spec_reason(child_id, "tracked"), ctx);
+                };
 
                 match self.supervisor.on_child_exit(&spec, actor, reason, ctx) {
                     SupervisorDirective::Ignore => ActorTurn::Continue,
@@ -215,7 +218,7 @@ impl<S: Supervisor> SupervisorActor<S> {
         child_id: &'static str,
         ctx: &mut C,
     ) -> ActorTurn {
-        if plan.complete_shutdown(child_id).is_err() {
+        if let Err(RestartPlanError::UnexpectedChild(child_id)) = plan.complete_shutdown(child_id) {
             return self.begin_shutdown(
                 ExitReason::Error(format!(
                     "child `{child_id}` exited while a restart was in progress"
@@ -242,11 +245,10 @@ impl<S: Supervisor> SupervisorActor<S> {
             return self.advance_restart(plan, child_id, ctx);
         };
 
-        let spec = self
-            .state
-            .spec(child_id)
-            .cloned()
-            .expect("restart target must have a spec");
+        let spec = self.state.spec(child_id).cloned();
+        let Some(spec) = spec else {
+            return self.begin_shutdown(missing_child_spec_reason(child_id, "restart target"), ctx);
+        };
 
         if ctx.shutdown_actor(actor, spec.shutdown).is_err() {
             self.state.forget_child_actor(actor);
@@ -326,11 +328,11 @@ impl<S: Supervisor> SupervisorActor<S> {
             return self.advance_shutdown(plan, child_id, ctx);
         };
 
-        let spec = self
-            .state
-            .spec(child_id)
-            .cloned()
-            .expect("shutdown target must have a spec");
+        let spec = self.state.spec(child_id).cloned();
+        let Some(spec) = spec else {
+            return self
+                .begin_shutdown(missing_child_spec_reason(child_id, "shutdown target"), ctx);
+        };
 
         if ctx.shutdown_actor(actor, spec.shutdown).is_err() {
             self.state.forget_child_actor(actor);
@@ -352,11 +354,11 @@ impl<S: Supervisor> SupervisorActor<S> {
             return Err(StartChildError::AlreadyStarted(child_id));
         }
 
-        let spec = self.state.spec(child_id).cloned().ok_or_else(|| {
-            StartChildError::InitFailed(ExitReason::Error(format!(
-                "unknown child spec `{child_id}`"
-            )))
-        })?;
+        let spec = self
+            .state
+            .spec(child_id)
+            .cloned()
+            .ok_or(StartChildError::UnknownChild(child_id))?;
 
         let mut child_ctx = SupervisorChildContext::new(ctx, child_id);
         let actor = self.supervisor.start_child(&spec, &mut child_ctx)?;
@@ -380,13 +382,16 @@ impl<S: Supervisor> SupervisorActor<S> {
     }
 }
 
-fn start_child_failure(spec: &ChildSpec, error: StartChildError) -> ExitReason {
+fn start_child_failure(child_id: &'static str, error: StartChildError) -> ExitReason {
     match error {
         StartChildError::SpawnRejected => {
-            ExitReason::Error(format!("supervisor rejected child spawn for `{}`", spec.id))
+            ExitReason::Error(format!("supervisor rejected child spawn for `{child_id}`"))
         }
         StartChildError::AlreadyStarted(child_id) => {
             ExitReason::Error(format!("supervisor child `{child_id}` is already running"))
+        }
+        StartChildError::UnknownChild(child_id) => {
+            ExitReason::Error(format!("unknown supervisor child `{child_id}`"))
         }
         StartChildError::InitFailed(reason) => reason,
     }
@@ -396,8 +401,15 @@ fn format_start_child_error(error: &StartChildError) -> String {
     match error {
         StartChildError::SpawnRejected => "spawn rejected".into(),
         StartChildError::AlreadyStarted(child_id) => format!("child `{child_id}` already started"),
+        StartChildError::UnknownChild(child_id) => format!("unknown child `{child_id}`"),
         StartChildError::InitFailed(reason) => format!("init failed: {reason:?}"),
     }
+}
+
+fn missing_child_spec_reason(child_id: &'static str, context: &str) -> ExitReason {
+    ExitReason::Error(format!(
+        "{context} child `{child_id}` is missing its supervisor spec"
+    ))
 }
 
 /// Computes which children should restart for a failed child under the strategy.
