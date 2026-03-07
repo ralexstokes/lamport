@@ -6,10 +6,10 @@ use std::{
 };
 
 use lamport::{
-    ActorId, ActorStatus, Application, CallOutcome, ChildSpec, Context, ExitReason, GenServer,
-    LocalRuntime, Ref, ReplyToken, Restart, RuntimeInfo, ServerOutcome, Shutdown, SpawnOptions,
-    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
-    boot_local_application, restart_scope,
+    ActorId, ActorStatus, Application, CallOutcome, ChildSpec, ConcurrentRuntime, Context,
+    ExitReason, GenServer, Ref, ReplyToken, Restart, RuntimeInfo, ServerOutcome, Shutdown,
+    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
+    boot_concurrent_application, restart_scope,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -84,6 +84,12 @@ struct ProviderConfig {
     api_key: String,
 }
 
+impl ProviderConfig {
+    fn prompt_cache_key(&self) -> String {
+        format!("multi-llm-agents/{}/{}", self.kind.label(), self.model)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExampleConfig {
     openai: ProviderConfig,
@@ -115,7 +121,10 @@ impl ExampleConfig {
 
 #[derive(Debug, Clone)]
 enum ProviderCall {
-    ChooseMove { prompt: String },
+    ChooseMove {
+        system_prompt: String,
+        update: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +137,7 @@ enum ProviderReply {
 struct ProviderAnswer {
     model: String,
     text: String,
+    cache_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,9 +146,95 @@ struct ProviderFailure {
     error: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationRole {
+    User,
+    Assistant,
+}
+
+impl ConversationRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConversationMessage {
+    role: ConversationRole,
+    content: String,
+}
+
+impl ConversationMessage {
+    fn user(content: String) -> Self {
+        Self {
+            role: ConversationRole::User,
+            content,
+        }
+    }
+
+    fn assistant(content: String) -> Self {
+        Self {
+            role: ConversationRole::Assistant,
+            content,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderConversation {
+    system_prompt: String,
+    messages: Vec<ConversationMessage>,
+}
+
+impl ProviderConversation {
+    fn new(system_prompt: String) -> Self {
+        Self {
+            system_prompt,
+            messages: Vec::new(),
+        }
+    }
+
+    fn build_request(&self, update: &str) -> ProviderRequest {
+        let mut messages = self.messages.clone();
+        messages.push(ConversationMessage::user(update.to_owned()));
+        ProviderRequest {
+            system_prompt: self.system_prompt.clone(),
+            messages,
+        }
+    }
+
+    fn record_success(&mut self, update: String, reply: String) {
+        self.messages.push(ConversationMessage::user(update));
+        self.messages.push(ConversationMessage::assistant(reply));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderRequest {
+    system_prompt: String,
+    messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProviderCall {
+    reply_to: ReplyToken,
+    update: String,
+}
+
 #[derive(Debug, Default)]
 struct ProviderState {
-    pending: BTreeMap<Ref, ReplyToken>,
+    pending: BTreeMap<Ref, PendingProviderCall>,
+    conversation: Option<ProviderConversation>,
+}
+
+impl ProviderState {
+    fn conversation_mut(&mut self, system_prompt: String) -> &mut ProviderConversation {
+        self.conversation
+            .get_or_insert_with(|| ProviderConversation::new(system_prompt))
+    }
 }
 
 struct ProviderServer {
@@ -170,10 +266,20 @@ impl GenServer for ProviderServer {
         ctx: &mut C,
     ) -> CallOutcome<Self::Reply> {
         match message {
-            ProviderCall::ChooseMove { prompt } => {
+            ProviderCall::ChooseMove {
+                system_prompt,
+                update,
+            } => {
                 let config = self.config.clone();
-                let task = ctx.spawn_blocking_io(move || request_provider(&config, &prompt));
-                state.pending.insert(task.id(), from);
+                let request = state.conversation_mut(system_prompt).build_request(&update);
+                let task = ctx.spawn_blocking_io(move || request_provider(&config, request));
+                state.pending.insert(
+                    task.id(),
+                    PendingProviderCall {
+                        reply_to: from,
+                        update,
+                    },
+                );
                 CallOutcome::NoReply
             }
         }
@@ -196,11 +302,11 @@ impl GenServer for ProviderServer {
     ) -> ServerOutcome {
         match message {
             RuntimeInfo::Task(task) => {
-                let Some(reply_to) = state.pending.remove(&task.reference) else {
+                let Some(pending) = state.pending.remove(&task.reference) else {
                     return ServerOutcome::Continue;
                 };
 
-                let result = match task.result.downcast::<Result<String, String>>() {
+                let result = match task.result.downcast::<Result<ProviderAnswer, String>>() {
                     Ok(result) => result,
                     Err(payload) => {
                         return ServerOutcome::Stop(ExitReason::Error(format!(
@@ -211,17 +317,22 @@ impl GenServer for ProviderServer {
                 };
 
                 let reply = match result {
-                    Ok(text) => ProviderReply::Success(ProviderAnswer {
-                        model: self.config.model.clone(),
-                        text,
-                    }),
+                    Ok(answer) => {
+                        let Some(conversation) = state.conversation.as_mut() else {
+                            return ServerOutcome::Stop(ExitReason::Error(
+                                "provider conversation missing while completing request".into(),
+                            ));
+                        };
+                        conversation.record_success(pending.update, answer.text.clone());
+                        ProviderReply::Success(answer)
+                    }
                     Err(error) => ProviderReply::Failure(ProviderFailure {
                         model: self.config.model.clone(),
                         error,
                     }),
                 };
 
-                let _ = ctx.reply(reply_to, reply);
+                let _ = ctx.reply(pending.reply_to, reply);
                 ServerOutcome::Continue
             }
             _ => ServerOutcome::Continue,
@@ -337,6 +448,7 @@ struct TurnRecord {
     model: String,
     square: usize,
     raw_response: String,
+    cache_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +464,7 @@ enum GameOutcome {
 struct CoordinatorState {
     pending_calls: BTreeMap<Ref, ProviderKind>,
     monitors: BTreeMap<Ref, ProviderKind>,
+    last_seen_turns: BTreeMap<ProviderKind, usize>,
     board: Board,
     turns: Vec<TurnRecord>,
     outcome: Option<GameOutcome>,
@@ -402,52 +515,62 @@ impl CoordinatorServer {
         }
     }
 
-    fn build_turn_prompt(&self, state: &CoordinatorState, provider: ProviderKind) -> String {
-        let history = if state.turns.is_empty() {
-            "None yet.".to_owned()
-        } else {
-            state
-                .turns
-                .iter()
-                .map(|turn| {
-                    format!(
-                        "{}. {} ({}) played square {}",
-                        turn.number,
-                        turn.player.label(),
-                        self.mark(turn.player).symbol(),
-                        turn.square
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
+    fn build_system_prompt(&self, provider: ProviderKind) -> String {
         format!(
             "You are playing tic-tac-toe against another LLM.\n\
-             You are the {provider_name} agent and your mark is {provider_mark}.\n\
-             Your opponent is the {opponent_name} agent with mark {opponent_mark}.\n\
-             For this match, {x_name} is X and {o_name} is O.\n\n\
-             Current board:\n\
-             {board}\n\n\
-             Available squares: {available}\n\n\
-             Move history:\n\
-             {history}\n\n\
-             Choose the strongest legal move.\n\
+             Your mark is {provider_mark} and your opponent is {opponent_mark}.\n\
+             The current board in the latest user message is authoritative.\n\
+             Choose the strongest legal move each turn.\n\
              Respond with JSON exactly matching this shape: {{\"move\": <square-number>}}.\n\
              The move must be a legal square number from 1 to 9.\n\
              Do not include any keys other than `move`, and do not include explanations or markdown.\n\
              If you return anything except one legal move, you lose by forfeit.",
-            provider_name = provider.label(),
             provider_mark = self.mark(provider).symbol(),
-            opponent_name = provider.opponent().label(),
             opponent_mark = self.mark(provider.opponent()).symbol(),
-            x_name = self.x_player.label(),
-            o_name = self.x_player.opponent().label(),
+        )
+    }
+
+    fn build_turn_update(&self, state: &CoordinatorState, provider: ProviderKind) -> String {
+        let last_seen_turn = state.last_seen_turns.get(&provider).copied().unwrap_or(0);
+        let updates = state
+            .turns
+            .iter()
+            .filter(|turn| turn.number > last_seen_turn)
+            .map(|turn| {
+                format!(
+                    "{}. {} ({}) played square {}",
+                    turn.number,
+                    turn.player.label(),
+                    self.mark(turn.player).symbol(),
+                    turn.square
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let delta = if updates.is_empty() {
+            if state.turns.is_empty() {
+                "No moves have been played yet.".to_owned()
+            } else {
+                "No new moves since your last response.".to_owned()
+            }
+        } else {
+            updates.join("\n")
+        };
+
+        format!(
+            "Match update for turn {turn_number}.\n\
+             New moves since your last response:\n\
+             {delta}\n\n\
+             Current board:\n\
+             {board}\n\n\
+             Available squares: {available}\n\n\
+             Choose your next move now.",
+            turn_number = state.turns.len() + 1,
+            delta = delta,
             board = state
                 .board
                 .render_for_prompt(|player| self.mark(player).symbol()),
             available = state.board.available_squares(),
-            history = history,
         )
     }
 
@@ -477,7 +600,8 @@ impl CoordinatorServer {
             .ask(
                 actor,
                 ProviderCall::ChooseMove {
-                    prompt: self.build_turn_prompt(state, provider),
+                    system_prompt: self.build_system_prompt(provider),
+                    update: self.build_turn_update(state, provider),
                 },
                 Some(PROVIDER_REQUEST_TIMEOUT),
             )
@@ -571,8 +695,10 @@ impl CoordinatorServer {
             model: answer.model,
             square,
             raw_response: answer.text,
+            cache_summary: answer.cache_summary,
         };
         state.turns.push(turn.clone());
+        state.last_seen_turns.insert(provider, turn.number);
 
         println!(
             "Turn {}: {} ({}) [{}] played square {}\n{}\n",
@@ -585,6 +711,9 @@ impl CoordinatorServer {
                 .board
                 .render_final(|player| self.mark(player).symbol()),
         );
+        if let Some(cache_summary) = turn.cache_summary.as_deref() {
+            println!("Cache: {cache_summary}\n");
+        }
 
         if state.board.winner() == Some(provider) {
             return self.finish_game(
@@ -632,6 +761,9 @@ impl CoordinatorServer {
                     turn.model,
                     turn.square
                 );
+                if let Some(cache_summary) = turn.cache_summary.as_deref() {
+                    println!("   cache: {cache_summary}");
+                }
 
                 let raw = turn.raw_response.trim();
                 if raw != turn.square.to_string() {
@@ -915,7 +1047,7 @@ impl Application for MultiLlmApplication {
     }
 }
 
-fn wait_until_dead(runtime: &mut LocalRuntime, actor: ActorId) {
+fn wait_until_dead(runtime: &ConcurrentRuntime, actor: ActorId) {
     let deadline = Instant::now() + COORDINATOR_DEADLINE;
 
     while Instant::now() < deadline {
@@ -926,21 +1058,36 @@ fn wait_until_dead(runtime: &mut LocalRuntime, actor: ActorId) {
             return;
         }
 
-        let _ = runtime.block_on_next(Some(Duration::from_millis(250)));
-        runtime.run_until_idle();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(250));
+        let _ = runtime.wait_for_idle(Some(wait));
     }
 
     panic!("actor {actor} did not terminate in time");
 }
 
-fn request_provider(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+// Prompt-caching notes:
+// - OpenAI caches exact prompt prefixes automatically, so the request keeps a
+//   stable system prompt and append-only message history at the front, with the
+//   newest turn update appended at the end. Reusing prompt_cache_key improves
+//   routing for those shared prefixes.
+// - Anthropic's Messages API supports automatic prompt caching with top-level
+//   cache_control. Keeping the conversation append-only lets the cache point
+//   advance with each turn instead of rebuilding a brand new prompt every time.
+fn request_provider(
+    config: &ProviderConfig,
+    request: ProviderRequest,
+) -> Result<ProviderAnswer, String> {
     match config.kind {
-        ProviderKind::OpenAI => request_openai(config, prompt),
-        ProviderKind::Anthropic => request_anthropic(config, prompt),
+        ProviderKind::OpenAI => request_openai(config, &request),
+        ProviderKind::Anthropic => request_anthropic(config, &request),
     }
 }
 
-fn request_openai(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+fn request_openai(
+    config: &ProviderConfig,
+    request: &ProviderRequest,
+) -> Result<ProviderAnswer, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(90))
         .build()
@@ -951,8 +1098,9 @@ fn request_openai(config: &ProviderConfig, prompt: &str) -> Result<String, Strin
         .bearer_auth(&config.api_key)
         .json(&json!({
             "model": config.model,
-            "input": prompt,
+            "input": openai_messages(request),
             "max_output_tokens": 512,
+            "prompt_cache_key": config.prompt_cache_key(),
             "reasoning": {
                 "effort": "minimal"
             },
@@ -978,11 +1126,20 @@ fn request_openai(config: &ProviderConfig, prompt: &str) -> Result<String, Strin
         ));
     }
 
-    extract_openai_text(&body)
-        .ok_or_else(|| format!("OpenAI response did not contain text: {}", body))
+    let text = extract_openai_text(&body)
+        .ok_or_else(|| format!("OpenAI response did not contain text: {}", body))?;
+
+    Ok(ProviderAnswer {
+        model: config.model.clone(),
+        text,
+        cache_summary: openai_cache_summary(&body),
+    })
 }
 
-fn request_anthropic(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+fn request_anthropic(
+    config: &ProviderConfig,
+    request: &ProviderRequest,
+) -> Result<ProviderAnswer, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(90))
         .build()
@@ -996,12 +1153,11 @@ fn request_anthropic(config: &ProviderConfig, prompt: &str) -> Result<String, St
             "model": config.model,
             "max_tokens": 128,
             "temperature": 0.0,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "cache_control": {
+                "type": "ephemeral"
+            },
+            "system": request.system_prompt,
+            "messages": anthropic_messages(request),
             "output_config": {
                 "format": {
                     "type": "json_schema",
@@ -1032,8 +1188,42 @@ fn request_anthropic(config: &ProviderConfig, prompt: &str) -> Result<String, St
         return Err(format_http_error("Anthropic", status.as_u16(), &body));
     }
 
-    extract_anthropic_text(&body)
-        .ok_or_else(|| format!("Anthropic response did not contain text: {}", body))
+    let text = extract_anthropic_text(&body)
+        .ok_or_else(|| format!("Anthropic response did not contain text: {}", body))?;
+
+    Ok(ProviderAnswer {
+        model: config.model.clone(),
+        text,
+        cache_summary: anthropic_cache_summary(&body),
+    })
+}
+
+fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
+    messages.push(json!({
+        "role": "system",
+        "content": request.system_prompt,
+    }));
+    messages.extend(request.messages.iter().map(|message| {
+        json!({
+            "role": message.role.as_str(),
+            "content": message.content,
+        })
+    }));
+    messages
+}
+
+fn anthropic_messages(request: &ProviderRequest) -> Vec<Value> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": message.role.as_str(),
+                "content": message.content,
+            })
+        })
+        .collect()
 }
 
 fn extract_openai_text(body: &Value) -> Option<String> {
@@ -1085,6 +1275,60 @@ fn extract_anthropic_text(body: &Value) -> Option<String> {
     }
 
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn openai_cache_summary(body: &Value) -> Option<String> {
+    let usage = body.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64);
+    let cached_tokens = usage
+        .get("input_tokens_details")
+        .or_else(|| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64));
+
+    match (input_tokens, cached_tokens) {
+        (Some(input_tokens), Some(cached_tokens)) => Some(format!(
+            "{} of {} input tokens served from cache",
+            cached_tokens, input_tokens
+        )),
+        (None, Some(cached_tokens)) => {
+            Some(format!("{cached_tokens} input tokens served from cache"))
+        }
+        (Some(input_tokens), None) => Some(format!(
+            "{input_tokens} input tokens processed (cache usage not reported)"
+        )),
+        (None, None) => None,
+    }
+}
+
+fn anthropic_cache_summary(body: &Value) -> Option<String> {
+    let usage = body.get("usage")?;
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let mut parts = Vec::new();
+    if let Some(input_tokens) = input_tokens {
+        parts.push(format!("{input_tokens} uncached input tokens"));
+    }
+    if cache_read > 0 {
+        parts.push(format!("{cache_read} cache-read tokens"));
+    }
+    if cache_write > 0 {
+        parts.push(format!("{cache_write} cache-write tokens"));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1195,19 +1439,21 @@ fn run() -> Result<(), String> {
         config.openai.model, config.anthropic.model
     );
 
-    let (mut runtime, app) = boot_local_application(
+    let (runtime, app) = boot_concurrent_application(
         MultiLlmApplication {
             config: config.clone(),
         },
         Default::default(),
     )
     .map_err(|error| format!("boot application failed: {error:?}"))?;
-    runtime.run_until_idle();
+    if !runtime.wait_for_idle(Some(Duration::from_secs(2))) {
+        return Err("runtime did not reach idle after boot".to_owned());
+    }
 
     let coordinator = runtime
         .resolve_name(COORDINATOR_NAME)
         .ok_or_else(|| "coordinator did not register".to_owned())?;
-    wait_until_dead(&mut runtime, coordinator);
+    wait_until_dead(&runtime, coordinator);
 
     let coordinator_exit = runtime
         .actor_snapshot(coordinator)
@@ -1215,7 +1461,7 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "coordinator exit reason was not retained".to_owned())?;
 
     let _ = runtime.exit_actor(app.root_supervisor(), ExitReason::Shutdown);
-    runtime.run_until_idle();
+    let _ = runtime.wait_for_idle(Some(Duration::from_secs(2)));
 
     match coordinator_exit {
         ExitReason::Normal => Ok(()),

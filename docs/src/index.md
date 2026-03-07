@@ -1,10 +1,23 @@
 # lamport Docs
 
-This book currently contains the normative functional spec for the runtime.
+`lamport` is an OTP-inspired, single-node actor runtime scaffold for Rust.
+The repository gives you both low-level actor primitives and higher-level
+behaviours for building OTP-style services:
 
-- [`SPEC.md`](./SPEC.md) is intended to be self-contained enough to recreate the
-  system from scratch in a fresh directory, including in another language.
+- raw turn-based actors
+- typed `GenServer` and `GenStatem` adapters
+- supervisors, child specs, and restart policies
+- application boot helpers for root supervisor trees
+- runtime introspection, lifecycle events, crash reports, and Prometheus-style
+  metrics
+- both a deterministic local runtime and a concurrent multi-scheduler runtime
 
-The spec is written from the current repository behavior, but it is intentionally
-language-neutral and focuses on runtime semantics rather than repository module
-layout.
+Use this book in two layers:
+
+- [`What This Repo Provides`](./what-this-repo-provides.md) explains the crate's
+  main building blocks and where each one fits.
+- [`Common Use Cases`](./common-use-cases.md) shows which APIs and examples to
+  reach for in day-to-day usage.
+- [`SPEC.md`](./SPEC.md) is the normative functional specification. It is
+  intentionally language-neutral and focused on runtime semantics rather than
+  repository layout.
