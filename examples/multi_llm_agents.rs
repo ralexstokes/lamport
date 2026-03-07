@@ -7,9 +7,9 @@ use std::{
 
 use lamport::{
     ActorId, ActorStatus, Application, CallOutcome, ChildSpec, ConcurrentRuntime, Context,
-    ExitReason, GenServer, Ref, ReplyToken, Restart, RuntimeInfo, ServerOutcome, Shutdown,
-    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
-    boot_concurrent_application, restart_scope,
+    ExitReason, GenServer, Ref, ReplyToken, Restart, ServerOutcome, Shutdown, SpawnOptions,
+    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
+    behaviour::RuntimeInfo, boot_concurrent_application, restart_scope,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -309,9 +309,10 @@ impl GenServer for ProviderServer {
                 let result = match task.result.downcast::<Result<ProviderAnswer, String>>() {
                     Ok(result) => result,
                     Err(payload) => {
+                        let payload_type = payload.type_name();
                         return ServerOutcome::Stop(ExitReason::Error(format!(
                             "unexpected provider task result `{}`",
-                            payload.type_name()
+                            payload_type
                         )));
                     }
                 };
@@ -872,9 +873,10 @@ impl GenServer for CoordinatorServer {
                 let reply = match message.downcast::<ProviderReply>() {
                     Ok(reply) => reply,
                     Err(payload) => {
+                        let payload_type = payload.type_name();
                         return ServerOutcome::Stop(ExitReason::Error(format!(
                             "unexpected coordinator reply `{}`",
-                            payload.type_name()
+                            payload_type
                         )));
                     }
                 };

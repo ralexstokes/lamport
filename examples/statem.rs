@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use lamport::{
     Actor, ActorTurn, CastMessage, Context, Envelope, ExitReason, GenStatem, LocalRuntime,
-    ReplyToken, RuntimeInfo, SchedulerConfig, StatemCallOutcome, StatemOutcome, TimerToken,
+    ReplyToken, SchedulerConfig, StatemCallOutcome, StatemOutcome, TimerToken,
+    behaviour::RuntimeInfo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

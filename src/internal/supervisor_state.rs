@@ -1,11 +1,9 @@
 use std::{collections::BTreeMap, time::Instant};
 
-use tokio::task::JoinHandle;
-
 use crate::{
     snapshot::{SupervisorChildSnapshot, SupervisorSnapshot},
     supervisor::RestartIntensity,
-    types::{ActorId, ChildSpec, ExitReason, Shutdown, SupervisorFlags},
+    types::{ActorId, ChildSpec, SupervisorFlags},
 };
 
 #[derive(Debug, Clone)]
@@ -52,41 +50,4 @@ impl SupervisorRuntimeState {
             active_restarts: self.intensity.active_restarts(Instant::now()),
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct ShutdownTracker {
-    pub(crate) requester: ActorId,
-    pub(crate) policy: Shutdown,
-    pub(crate) task: Option<JoinHandle<()>>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct TurnEffects {
-    pub(crate) exit_reason: Option<ExitReason>,
-    pub(crate) yielded: bool,
-}
-
-pub(crate) fn panic_reason(
-    actor: ActorId,
-    name: &'static str,
-    payload: Box<dyn std::any::Any + Send>,
-) -> ExitReason {
-    let detail = payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| {
-            payload
-                .downcast_ref::<&'static str>()
-                .map(|message| (*message).to_owned())
-        })
-        .unwrap_or_else(|| "unknown panic".to_owned());
-
-    ExitReason::Error(format!("actor `{name}` ({actor}) panicked: {detail}"))
-}
-
-pub(crate) fn mailbox_overflow_reason(actor: ActorId, label: &str) -> ExitReason {
-    ExitReason::Error(format!(
-        "actor `{actor}` mailbox overflow while delivering {label}"
-    ))
 }

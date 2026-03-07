@@ -37,13 +37,13 @@ pub mod behaviour;
 pub mod concurrent;
 pub mod context;
 pub mod envelope;
+pub(crate) mod internal;
 pub mod lifecycle;
 pub mod mailbox;
 pub mod observability;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
-pub(crate) mod shared;
 pub mod snapshot;
 pub mod supervisor;
 pub mod types;
@@ -53,33 +53,24 @@ pub use application::{
     Application, ApplicationHandle, boot_concurrent_application, boot_local_application,
 };
 pub use behaviour::{
-    CallOutcome, CastMessage, GenServer, GenServerActor, GenStatem, GenStatemActor, InfoMessage,
-    RuntimeInfo, ServerOutcome, StatemCallOutcome, StatemOutcome,
+    CallOutcome, CastMessage, GenServer, GenStatem, InfoMessage, ServerOutcome, StatemCallOutcome,
+    StatemOutcome,
 };
 pub use concurrent::ConcurrentRuntime;
 pub use context::{
-    Context, LinkError, MonitorError, PendingCall, SendError, SpawnError, SpawnOptions, TaskHandle,
-    TimerError,
+    ActorContext, BehaviourContextExt, Context, LifecycleContext, LinkError, MonitorError,
+    PendingCall, SendError, SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
 };
 pub use envelope::{
     CallTimedOut, DownMessage, Envelope, EnvelopeKind, ExitSignal, Message, Payload,
-    RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, SystemMessage, TaskCompleted, TimerFired,
+    RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, TaskCompleted, TimerFired,
 };
 pub use lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase};
-pub use mailbox::{Mailbox, MailboxWatermark};
-pub use observability::{
-    ActorTree, ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
-    RuntimeMetricsSnapshot,
-};
-pub use registry::{Registry, RegistryError};
+pub use registry::RegistryError;
 pub use runtime::LocalRuntime;
-pub use scheduler::{
-    PoolKind, RunQueueSnapshot, ScheduleError, Scheduler, SchedulerConfig, SchedulerMetrics,
-};
-pub use snapshot::{ActorSnapshot, SupervisorChildSnapshot, SupervisorSnapshot};
+pub use scheduler::{PoolKind, SchedulerConfig};
 pub use supervisor::{
-    RestartIntensity, StartChildError, Supervisor, SupervisorActor, SupervisorDirective,
-    restart_scope,
+    RestartIntensity, StartChildError, Supervisor, SupervisorDirective, restart_scope,
 };
 pub use types::{
     ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Restart,

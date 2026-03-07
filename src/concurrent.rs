@@ -1,6 +1,8 @@
+mod lifecycle;
+mod worker;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -15,11 +17,15 @@ use crate::{
     actor::{Actor, ActorTurn},
     behaviour::{GenServer, GenServerActor, GenStatem, GenStatemActor, RuntimeInfo},
     context::{
-        Context, LinkError, MonitorError, PendingCall, SendError, SpawnError, SpawnOptions,
-        TaskHandle, TimerError,
+        ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
+        SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
     envelope::{
         DownMessage, Envelope, ExitSignal, Message, Payload, ReplyToken, TaskCompleted, TimerFired,
+    },
+    internal::{
+        ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason,
+        normalize_scheduler_config,
     },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull},
@@ -38,10 +44,6 @@ use crate::{
         ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Shutdown,
         SupervisorFlags, TimerToken,
     },
-};
-
-use crate::shared::{
-    ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason, panic_reason,
 };
 
 trait ActorCell: Send {
@@ -180,11 +182,22 @@ struct RuntimeShared {
 }
 
 impl RuntimeShared {
-    fn actor_matches(state: &RuntimeState, actor: ActorId) -> bool {
+    fn actor_ref(state: &RuntimeState, actor: ActorId) -> Option<&ActorRecord> {
         state
             .actors
             .get(&actor.local_id)
-            .is_some_and(|entry| entry.id == actor)
+            .and_then(|entry| (entry.id == actor).then_some(entry))
+    }
+
+    fn actor_mut(state: &mut RuntimeState, actor: ActorId) -> Option<&mut ActorRecord> {
+        state
+            .actors
+            .get_mut(&actor.local_id)
+            .and_then(|entry| (entry.id == actor).then_some(entry))
+    }
+
+    fn actor_matches(state: &RuntimeState, actor: ActorId) -> bool {
+        Self::actor_ref(state, actor).is_some()
     }
 
     fn is_idle_state(state: &RuntimeState) -> bool {
@@ -301,7 +314,7 @@ impl RuntimeShared {
         let runtime = Arc::clone(self);
         drop(
             self.actor_handle
-                .spawn(run_actor_task(runtime, actor_id, Box::new(actor))),
+                .spawn(worker::run_actor_task(runtime, actor_id, Box::new(actor))),
         );
         notify.notify_one();
         self.idle_cv.notify_all();
@@ -315,11 +328,7 @@ impl RuntimeShared {
 
         let notify = {
             let mut state = self.lock_state();
-            let Some(target) = state
-                .actors
-                .get_mut(&actor.local_id)
-                .and_then(|entry| (entry.id == actor).then_some(entry))
-            else {
+            let Some(target) = Self::actor_mut(&mut state, actor) else {
                 return Err(SendError::NoProc(actor));
             };
 
@@ -350,11 +359,7 @@ impl RuntimeShared {
     fn request_force_exit(&self, actor: ActorId, reason: ExitReason) -> bool {
         let notify = {
             let mut state = self.lock_state();
-            let Some(target) = state
-                .actors
-                .get_mut(&actor.local_id)
-                .and_then(|entry| (entry.id == actor).then_some(entry))
-            else {
+            let Some(target) = Self::actor_mut(&mut state, actor) else {
                 return false;
             };
 
@@ -381,11 +386,7 @@ impl RuntimeShared {
     fn cancel_actor_timer(&self, actor: ActorId, token: TimerToken) -> bool {
         let handle = {
             let mut state = self.lock_state();
-            state
-                .actors
-                .get_mut(&actor.local_id)
-                .and_then(|entry| (entry.id == actor).then_some(entry))
-                .and_then(|entry| entry.timer_tasks.remove(&token))
+            Self::actor_mut(&mut state, actor).and_then(|entry| entry.timer_tasks.remove(&token))
         };
 
         if let Some(handle) = handle {
@@ -399,10 +400,7 @@ impl RuntimeShared {
     fn cancel_call_timeout(&self, actor: ActorId, reference: Ref) -> bool {
         let handle = {
             let mut state = self.lock_state();
-            state
-                .actors
-                .get_mut(&actor.local_id)
-                .and_then(|entry| (entry.id == actor).then_some(entry))
+            Self::actor_mut(&mut state, actor)
                 .and_then(|entry| entry.call_timeout_tasks.remove(&reference))
         };
 
@@ -540,20 +538,12 @@ impl RuntimeShared {
 
     fn register_name(&self, actor: ActorId, name: String) -> Result<(), RegistryError> {
         let mut state = self.lock_state();
-        if state
-            .actors
-            .get(&actor.local_id)
-            .is_none_or(|entry| entry.id != actor)
-        {
+        if !Self::actor_matches(&state, actor) {
             return Err(RegistryError::NoProc(actor));
         }
 
         state.registry.register(actor, name.clone())?;
-        if let Some(entry) = state
-            .actors
-            .get_mut(&actor.local_id)
-            .and_then(|record| (record.id == actor).then_some(record))
-        {
+        if let Some(entry) = Self::actor_mut(&mut state, actor) {
             entry.registered_name = Some(name);
         }
 
@@ -563,11 +553,7 @@ impl RuntimeShared {
     fn unregister_name(&self, actor: ActorId) -> Option<String> {
         let mut state = self.lock_state();
         let removed = state.registry.unregister(actor)?;
-        if let Some(entry) = state
-            .actors
-            .get_mut(&actor.local_id)
-            .and_then(|record| (record.id == actor).then_some(record))
-        {
+        if let Some(entry) = Self::actor_mut(&mut state, actor) {
             entry.registered_name = None;
         }
         Some(removed)
@@ -575,16 +561,12 @@ impl RuntimeShared {
 
     fn supervisor_snapshot(&self, actor: ActorId) -> Option<SupervisorSnapshot> {
         let mut state = self.lock_state();
-        state
-            .actors
-            .get_mut(&actor.local_id)
-            .and_then(|entry| (entry.id == actor).then_some(entry))
-            .and_then(|entry| {
-                entry
-                    .supervisor
-                    .as_mut()
-                    .map(|supervisor| supervisor.snapshot(actor))
-            })
+        Self::actor_mut(&mut state, actor).and_then(|entry| {
+            entry
+                .supervisor
+                .as_mut()
+                .map(|supervisor| supervisor.snapshot(actor))
+        })
     }
 
     fn lifecycle_events(&self) -> Vec<LifecycleEvent> {
@@ -597,10 +579,8 @@ impl RuntimeShared {
 
     fn actor_snapshot(&self, actor: ActorId) -> Option<ActorSnapshot> {
         let state = self.lock_state();
-        state
-            .actors
-            .get(&actor.local_id)
-            .and_then(|entry| (entry.id == actor).then(|| entry.snapshot()))
+        Self::actor_ref(&state, actor)
+            .map(ActorRecord::snapshot)
             .or_else(|| state.completed.get(&actor).cloned())
     }
 
@@ -625,10 +605,8 @@ impl RuntimeShared {
     }
 
     fn actor_identity_from_state(state: &RuntimeState, actor: ActorId) -> Option<ActorIdentity> {
-        state
-            .actors
-            .get(&actor.local_id)
-            .and_then(|entry| (entry.id == actor).then(|| entry.snapshot()))
+        Self::actor_ref(state, actor)
+            .map(ActorRecord::snapshot)
             .or_else(|| state.completed.get(&actor).cloned())
             .map(|snapshot| {
                 ActorIdentity::new(snapshot.id, snapshot.name, snapshot.registered_name.clone())
@@ -681,10 +659,7 @@ impl ConcurrentContext {
         F: FnOnce(&ActorRecord) -> R,
     {
         let state = self.runtime.lock_state();
-        let actor = state
-            .actors
-            .get(&self.actor_id.local_id)
-            .and_then(|entry| (entry.id == self.actor_id).then_some(entry))
+        let actor = RuntimeShared::actor_ref(&state, self.actor_id)
             .expect("current actor must exist while running");
         op(actor)
     }
@@ -694,10 +669,7 @@ impl ConcurrentContext {
         F: FnOnce(&mut ActorRecord) -> R,
     {
         let mut state = self.runtime.lock_state();
-        let actor = state
-            .actors
-            .get_mut(&self.actor_id.local_id)
-            .and_then(|entry| (entry.id == self.actor_id).then_some(entry))
+        let actor = RuntimeShared::actor_mut(&mut state, self.actor_id)
             .expect("current actor must exist while running");
         op(actor)
     }
@@ -922,7 +894,7 @@ impl ConcurrentContext {
     }
 }
 
-impl Context for ConcurrentContext {
+impl ActorContext for ConcurrentContext {
     fn actor_id(&self) -> ActorId {
         self.actor_id
     }
@@ -1021,6 +993,74 @@ impl Context for ConcurrentContext {
         self.effects.exit_reason = Some(reason);
     }
 
+    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
+        if !self.runtime.contains(actor) {
+            return Err(SendError::NoProc(actor));
+        }
+
+        {
+            let mut state = self.runtime.lock_state();
+            if !RuntimeShared::actor_matches(&state, actor) {
+                return Err(SendError::NoProc(actor));
+            }
+
+            let prior = RuntimeShared::actor_mut(&mut state, actor)
+                .expect("target actor must exist")
+                .shutdown
+                .take();
+            if let Some(mut tracker) = prior
+                && let Some(task) = tracker.task.take()
+            {
+                task.abort();
+            }
+
+            RuntimeShared::record_lifecycle_event(
+                &mut state,
+                LifecycleEvent::Shutdown {
+                    requester: self.actor_id,
+                    actor,
+                    policy: policy.clone(),
+                    phase: ShutdownPhase::Requested,
+                    reason: None,
+                },
+            );
+
+            let task = match policy.clone() {
+                Shutdown::BrutalKill => None,
+                Shutdown::Timeout(delay) => Some(self.runtime.spawn_shutdown_timeout(actor, delay)),
+                Shutdown::Infinity => None,
+            };
+
+            RuntimeShared::actor_mut(&mut state, actor)
+                .expect("target actor must exist")
+                .shutdown = Some(ShutdownTracker {
+                requester: self.actor_id,
+                policy: policy.clone(),
+                task,
+            });
+        }
+
+        match policy {
+            Shutdown::BrutalKill => {
+                self.runtime.request_force_exit(actor, ExitReason::Kill);
+            }
+            Shutdown::Timeout(_) | Shutdown::Infinity => {
+                self.runtime.propagate_link_exit(
+                    actor,
+                    ExitSignal {
+                        from: self.actor_id,
+                        reason: ExitReason::Shutdown,
+                        linked: true,
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl SupervisorContext for ConcurrentContext {
     fn configure_supervisor(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
         self.actor_record_mut(|actor| {
             actor.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
@@ -1057,542 +1097,13 @@ impl Context for ConcurrentContext {
             }
         });
     }
+}
 
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
-        if !self.runtime.contains(actor) {
-            return Err(SendError::NoProc(actor));
-        }
-
-        {
-            let mut state = self.runtime.lock_state();
-            if !RuntimeShared::actor_matches(&state, actor) {
-                return Err(SendError::NoProc(actor));
-            }
-
-            let prior = state
-                .actors
-                .get_mut(&actor.local_id)
-                .expect("target actor must exist")
-                .shutdown
-                .take();
-            if let Some(mut tracker) = prior
-                && let Some(task) = tracker.task.take()
-            {
-                task.abort();
-            }
-
-            RuntimeShared::record_lifecycle_event(
-                &mut state,
-                LifecycleEvent::Shutdown {
-                    requester: self.actor_id,
-                    actor,
-                    policy: policy.clone(),
-                    phase: ShutdownPhase::Requested,
-                    reason: None,
-                },
-            );
-
-            let task = match policy.clone() {
-                Shutdown::BrutalKill => None,
-                Shutdown::Timeout(delay) => Some(self.runtime.spawn_shutdown_timeout(actor, delay)),
-                Shutdown::Infinity => None,
-            };
-
-            state
-                .actors
-                .get_mut(&actor.local_id)
-                .expect("target actor must exist")
-                .shutdown = Some(ShutdownTracker {
-                requester: self.actor_id,
-                policy: policy.clone(),
-                task,
-            });
-        }
-
-        match policy {
-            Shutdown::BrutalKill => {
-                self.runtime.request_force_exit(actor, ExitReason::Kill);
-            }
-            Shutdown::Timeout(_) | Shutdown::Infinity => {
-                self.runtime.propagate_link_exit(
-                    actor,
-                    ExitSignal {
-                        from: self.actor_id,
-                        reason: ExitReason::Shutdown,
-                        linked: true,
-                    },
-                );
-            }
-        }
-
-        Ok(())
-    }
-
+impl LifecycleContext for ConcurrentContext {
     fn emit_lifecycle_event(&mut self, event: LifecycleEvent) {
         let mut state = self.runtime.lock_state();
         RuntimeShared::record_lifecycle_event(&mut state, event);
     }
-}
-
-impl RuntimeShared {
-    fn propagate_link_exit(&self, target: ActorId, signal: ExitSignal) {
-        let trap_exit = {
-            let state = self.lock_state();
-            let Some(target_state) = state
-                .actors
-                .get(&target.local_id)
-                .and_then(|entry| (entry.id == target).then_some(entry))
-            else {
-                return;
-            };
-
-            target_state.trap_exit
-        };
-
-        let kill_now = matches!(signal.reason, ExitReason::Kill)
-            || (signal.linked && !trap_exit && !matches!(signal.reason, ExitReason::Normal));
-
-        if kill_now {
-            self.request_force_exit(target, signal.reason);
-            return;
-        }
-
-        if signal.linked && !trap_exit && matches!(signal.reason, ExitReason::Normal) {
-            return;
-        }
-
-        let _ = self.enqueue_runtime_envelope(target, Envelope::Exit(signal), "exit");
-    }
-
-    fn finalize_actor(&self, actor: ActorId, name: &'static str, final_reason: ExitReason) {
-        let (linked, monitored_by, monitoring, shutdown_requested) = {
-            let mut state = self.lock_state();
-            let Some(mut entry) = state.actors.remove(&actor.local_id) else {
-                return;
-            };
-            if entry.id != actor {
-                state.actors.insert(entry.id.local_id, entry);
-                return;
-            }
-
-            state.registry.unregister(actor);
-
-            for (_, handle) in entry.timer_tasks.drain() {
-                handle.abort();
-            }
-            for (_, handle) in entry.call_timeout_tasks.drain() {
-                handle.abort();
-            }
-
-            let parent = entry.parent;
-            let ancestors = entry.ancestors.clone();
-            let registered_name = entry.registered_name.clone();
-            let supervisor_child = entry.supervisor_child;
-            let linked: Vec<_> = entry.links.iter().copied().collect();
-            let monitored_by: Vec<_> = entry
-                .monitors_in
-                .iter()
-                .map(|(reference, watcher)| (*reference, *watcher))
-                .collect();
-            let monitoring: Vec<_> = entry
-                .monitors_out
-                .iter()
-                .map(|(reference, target)| (*reference, *target))
-                .collect();
-
-            if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
-                && let Some(parent_state) = state
-                    .actors
-                    .get_mut(&parent.local_id)
-                    .and_then(|record| (record.id == parent).then_some(record))
-                && let Some(supervisor) = parent_state.supervisor.as_mut()
-            {
-                supervisor.clear_running(child_id, actor);
-            }
-
-            let mut shutdown_tracker = entry.shutdown.take();
-            if let Some(tracker) = shutdown_tracker.as_mut() {
-                if let Some(task) = tracker.task.take() {
-                    task.abort();
-                }
-
-                RuntimeShared::record_lifecycle_event(
-                    &mut state,
-                    LifecycleEvent::Shutdown {
-                        requester: tracker.requester,
-                        actor,
-                        policy: tracker.policy.clone(),
-                        phase: ShutdownPhase::Completed,
-                        reason: Some(final_reason.clone()),
-                    },
-                );
-            }
-
-            entry.status = ActorStatus::Dead;
-            entry.metrics.last_exit = Some(final_reason.clone());
-            entry.metrics.mailbox_len = 0;
-            entry.metrics.scheduler_id = None;
-            entry.registered_name = None;
-            let snapshot = entry.snapshot();
-
-            RuntimeShared::record_lifecycle_event(
-                &mut state,
-                LifecycleEvent::Exit {
-                    actor,
-                    name,
-                    reason: final_reason.clone(),
-                    parent,
-                    ancestors: ancestors.clone(),
-                },
-            );
-
-            if !matches!(final_reason, ExitReason::Normal | ExitReason::Shutdown) {
-                let parent_context = parent
-                    .and_then(|parent| RuntimeShared::actor_identity_from_state(&state, parent));
-                let ancestor_contexts = ancestors
-                    .iter()
-                    .filter_map(|ancestor| {
-                        RuntimeShared::actor_identity_from_state(&state, *ancestor)
-                    })
-                    .collect();
-
-                RuntimeShared::record_crash_report(
-                    &mut state,
-                    CrashReport {
-                        actor,
-                        name,
-                        registered_name: registered_name.clone(),
-                        parent,
-                        parent_context,
-                        ancestors: ancestors.clone(),
-                        ancestor_contexts,
-                        supervisor_child,
-                        reason: final_reason.clone(),
-                    },
-                );
-            }
-
-            state.completed.insert(actor, snapshot.clone());
-            state.live_actors = state.live_actors.saturating_sub(1);
-            (linked, monitored_by, monitoring, shutdown_tracker.is_some())
-        };
-
-        for (reference, target) in monitoring {
-            if target == actor {
-                continue;
-            }
-
-            let mut state = self.lock_state();
-            if let Some(target_state) = state
-                .actors
-                .get_mut(&target.local_id)
-                .and_then(|entry| (entry.id == target).then_some(entry))
-            {
-                target_state.monitors_in.remove(&reference);
-            }
-        }
-
-        for (reference, watcher) in monitored_by {
-            if watcher == actor {
-                continue;
-            }
-
-            {
-                let mut state = self.lock_state();
-                if let Some(watcher_state) = state
-                    .actors
-                    .get_mut(&watcher.local_id)
-                    .and_then(|entry| (entry.id == watcher).then_some(entry))
-                {
-                    watcher_state.monitors_out.remove(&reference);
-                }
-                RuntimeShared::record_lifecycle_event(
-                    &mut state,
-                    LifecycleEvent::Down {
-                        watcher,
-                        actor,
-                        reference,
-                        reason: final_reason.clone(),
-                    },
-                );
-            }
-
-            let _ = self.enqueue_runtime_envelope(
-                watcher,
-                Envelope::Down(DownMessage {
-                    reference,
-                    actor,
-                    reason: final_reason.clone(),
-                }),
-                "down",
-            );
-        }
-
-        let linked_reason = if shutdown_requested && matches!(final_reason, ExitReason::Kill) {
-            ExitReason::Shutdown
-        } else {
-            final_reason.clone()
-        };
-
-        for linked_actor in linked {
-            if linked_actor == actor {
-                continue;
-            }
-
-            {
-                let mut state = self.lock_state();
-                if let Some(other) = state
-                    .actors
-                    .get_mut(&linked_actor.local_id)
-                    .and_then(|entry| (entry.id == linked_actor).then_some(entry))
-                {
-                    other.links.remove(&actor);
-                }
-            }
-
-            self.propagate_link_exit(
-                linked_actor,
-                ExitSignal {
-                    from: actor,
-                    reason: linked_reason.clone(),
-                    linked: true,
-                },
-            );
-        }
-
-        self.idle_cv.notify_all();
-    }
-}
-
-async fn run_actor_task(
-    runtime: Arc<RuntimeShared>,
-    actor_id: ActorId,
-    mut actor: Box<dyn ActorCell>,
-) {
-    if let Some(reason) = run_init(&runtime, actor_id, actor.as_mut()) {
-        finish_actor_task(runtime, actor_id, actor, reason).await;
-        return;
-    }
-
-    let mut budget = 0_u32;
-
-    loop {
-        let next = {
-            let mut state = runtime.lock_state();
-            let Some(entry) = state
-                .actors
-                .get_mut(&actor_id.local_id)
-                .and_then(|record| (record.id == actor_id).then_some(record))
-            else {
-                return;
-            };
-
-            if let Some(reason) = entry.forced_exit.take() {
-                entry.status = ActorStatus::Exiting;
-                entry.metrics.scheduler_id = Some(entry.scheduler_id);
-                runtime.idle_cv.notify_all();
-                Either::Exit(reason)
-            } else if let Some(envelope) = entry.mailbox.pop_front() {
-                entry.metrics.mailbox_len = entry.mailbox.len();
-                entry.status = ActorStatus::Running;
-                entry.metrics.scheduler_id = Some(entry.scheduler_id);
-                entry.metrics.turns_run += 1;
-                let name = entry.name;
-                let scheduler_id = entry.scheduler_id;
-                state.metrics.normal_turns += 1;
-                Either::Envelope {
-                    envelope,
-                    name,
-                    scheduler_id,
-                }
-            } else {
-                entry.status = ActorStatus::Waiting;
-                entry.metrics.scheduler_id = None;
-                entry.metrics.mailbox_len = entry.mailbox.len();
-                let notify = Arc::clone(&entry.notify);
-                runtime.idle_cv.notify_all();
-                Either::Wait(notify)
-            }
-        };
-
-        match next {
-            Either::Exit(reason) => {
-                finish_actor_task(runtime, actor_id, actor, reason).await;
-                return;
-            }
-            Either::Envelope {
-                envelope,
-                name,
-                scheduler_id,
-            } => {
-                let (turn_result, effects) = {
-                    let envelope_kind = envelope.kind();
-                    let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
-                    let turn_span = tracing::trace_span!(
-                        "lamport.actor.turn",
-                        actor_id = %actor_id,
-                        actor_name = name,
-                        scheduler_id,
-                        envelope_kind = ?envelope_kind
-                    );
-                    let _turn_guard = turn_span.enter();
-                    let result =
-                        catch_unwind(AssertUnwindSafe(|| actor.handle(envelope, &mut ctx)));
-                    let effects = ctx.finish();
-                    (result, effects)
-                };
-
-                let exit_reason = match turn_result {
-                    Ok(turn) => effects.exit_reason.or(match turn {
-                        ActorTurn::Stop(reason) => Some(reason),
-                        ActorTurn::Continue | ActorTurn::Yield => None,
-                    }),
-                    Err(panic) => Some(panic_reason(actor_id, name, panic)),
-                };
-
-                if let Some(reason) = exit_reason {
-                    finish_actor_task(runtime, actor_id, actor, reason).await;
-                    return;
-                }
-
-                {
-                    let mut state = runtime.lock_state();
-                    if let Some(entry) = state
-                        .actors
-                        .get_mut(&actor_id.local_id)
-                        .and_then(|record| (record.id == actor_id).then_some(record))
-                    {
-                        entry.metrics.mailbox_len = entry.mailbox.len();
-                        entry.metrics.scheduler_id = None;
-                        if entry.mailbox.is_empty() {
-                            entry.status = ActorStatus::Waiting;
-                        } else {
-                            entry.status = ActorStatus::Runnable;
-                        }
-                    }
-                }
-                runtime.idle_cv.notify_all();
-
-                budget += 1;
-                if effects.yielded || budget >= runtime.config.actor_turn_budget.max(1) {
-                    budget = 0;
-                    tokio::task::yield_now().await;
-                }
-            }
-            Either::Wait(notify) => {
-                notify.notified().await;
-            }
-        }
-    }
-}
-
-fn run_init(
-    runtime: &Arc<RuntimeShared>,
-    actor_id: ActorId,
-    actor: &mut dyn ActorCell,
-) -> Option<ExitReason> {
-    let (name, scheduler_id) = {
-        let mut state = runtime.lock_state();
-        let entry = state
-            .actors
-            .get_mut(&actor_id.local_id)
-            .and_then(|record| (record.id == actor_id).then_some(record))
-            .expect("actor must exist during init");
-        entry.status = ActorStatus::Running;
-        entry.metrics.scheduler_id = Some(entry.scheduler_id);
-        (entry.name, entry.scheduler_id)
-    };
-
-    let (init_result, effects) = {
-        let mut ctx = ConcurrentContext::new(runtime.clone(), actor_id);
-        let init_span = tracing::debug_span!(
-            "lamport.actor.init",
-            actor_id = %actor_id,
-            actor_name = name,
-            scheduler_id
-        );
-        let _init_guard = init_span.enter();
-        let result = catch_unwind(AssertUnwindSafe(|| actor.init(&mut ctx)));
-        let effects = ctx.finish();
-        (result, effects)
-    };
-
-    match init_result {
-        Ok(Ok(())) => {
-            let mut state = runtime.lock_state();
-            if let Some(entry) = state
-                .actors
-                .get_mut(&actor_id.local_id)
-                .and_then(|record| (record.id == actor_id).then_some(record))
-            {
-                entry.initialized = true;
-                entry.metrics.scheduler_id = None;
-                if effects.exit_reason.is_some() {
-                    entry.status = ActorStatus::Exiting;
-                } else if entry.mailbox.is_empty() {
-                    entry.status = ActorStatus::Waiting;
-                } else {
-                    entry.status = ActorStatus::Runnable;
-                }
-            }
-            runtime.idle_cv.notify_all();
-            effects.exit_reason
-        }
-        Ok(Err(reason)) => Some(reason),
-        Err(panic) => Some(panic_reason(actor_id, name, panic)),
-    }
-}
-
-async fn finish_actor_task(
-    runtime: Arc<RuntimeShared>,
-    actor_id: ActorId,
-    mut actor: Box<dyn ActorCell>,
-    reason: ExitReason,
-) {
-    let name = {
-        let mut state = runtime.lock_state();
-        let entry = state
-            .actors
-            .get_mut(&actor_id.local_id)
-            .and_then(|record| (record.id == actor_id).then_some(record))
-            .expect("actor must exist during termination");
-        entry.status = ActorStatus::Exiting;
-        entry.metrics.scheduler_id = Some(entry.scheduler_id);
-        entry.name
-    };
-
-    let terminate_result = {
-        let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
-        let terminate_span = tracing::debug_span!(
-            "lamport.actor.terminate",
-            actor_id = %actor_id,
-            actor_name = name,
-            reason = %reason
-        );
-        let _terminate_guard = terminate_span.enter();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            actor.terminate(reason.clone(), &mut ctx)
-        }));
-        let _ = ctx.finish();
-        result
-    };
-
-    let final_reason = match terminate_result {
-        Ok(()) => reason,
-        Err(panic) => panic_reason(actor_id, name, panic),
-    };
-
-    runtime.finalize_actor(actor_id, name, final_reason);
-}
-
-enum Either {
-    Exit(ExitReason),
-    Envelope {
-        envelope: Envelope,
-        name: &'static str,
-        scheduler_id: usize,
-    },
-    Wait(Arc<Notify>),
 }
 
 fn push_envelope(state: &mut ActorRecord, envelope: Envelope) -> Result<(), SendError> {
@@ -1616,19 +1127,6 @@ fn push_envelope(state: &mut ActorRecord, envelope: Envelope) -> Result<(), Send
     })
 }
 
-fn normalize_config(mut config: SchedulerConfig) -> SchedulerConfig {
-    config.scheduler_count = config.scheduler_count.max(1);
-    config.max_actors = config.max_actors.max(1);
-    config.default_mailbox_capacity = config.default_mailbox_capacity.max(1);
-    config.mailbox_runtime_reserve = config
-        .mailbox_runtime_reserve
-        .min(config.default_mailbox_capacity.saturating_sub(1));
-    config.blocking_io_threads = config.blocking_io_threads.max(1);
-    config.blocking_cpu_threads = config.blocking_cpu_threads.max(1);
-    config.actor_turn_budget = config.actor_turn_budget.max(1);
-    config
-}
-
 /// A Tokio-backed multicore runtime that preserves Lamport's mailbox and supervision semantics.
 pub struct ConcurrentRuntime {
     config: SchedulerConfig,
@@ -1646,7 +1144,7 @@ impl Default for ConcurrentRuntime {
 impl ConcurrentRuntime {
     /// Creates a new runtime and returns any Tokio initialization error.
     pub fn try_new(config: SchedulerConfig) -> Result<Self, std::io::Error> {
-        let config = normalize_config(config);
+        let config = normalize_scheduler_config(config);
 
         let actor_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.scheduler_count)
@@ -1685,6 +1183,16 @@ impl ConcurrentRuntime {
     /// Creates a new runtime with a multicore Tokio scheduler.
     pub fn new(config: SchedulerConfig) -> Self {
         Self::try_new(config).expect("failed to initialize Tokio runtimes for lamport")
+    }
+
+    /// Boots an application root supervisor into an existing concurrent runtime.
+    pub fn boot_application<A: crate::application::Application>(
+        &self,
+        application: A,
+    ) -> Result<crate::application::ApplicationHandle, SpawnError> {
+        let (name, options, root_supervisor) = crate::application::prepare_application(application);
+        let root = self.spawn_supervisor_with_options(root_supervisor, options)?;
+        Ok(crate::application::ApplicationHandle::new(name, root))
     }
 
     /// Returns the scheduler configuration used by the runtime.
@@ -2054,7 +1562,8 @@ mod tests {
 
     use crate::{
         Actor, ActorTurn, Context, Envelope, ExitReason, LifecycleEvent, PoolKind, Ref,
-        RuntimeEventKind, SchedulerConfig, SendError, SpawnError, SpawnOptions, TimerToken,
+        SchedulerConfig, SendError, SpawnError, SpawnOptions, TimerToken,
+        observability::RuntimeEventKind,
     };
 
     use super::ConcurrentRuntime;
