@@ -6,7 +6,7 @@ mod types;
 
 pub use types::{
     ActorTree, ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
-    RuntimeMetricsSnapshot,
+    RuntimeMetricsSnapshot, TraceEvent, TraceEventKind,
 };
 
 pub(crate) use build::{build_actor_tree, build_metrics_snapshot, build_runtime_introspection};

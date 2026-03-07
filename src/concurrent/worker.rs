@@ -7,13 +7,16 @@ use tokio::sync::Notify;
 
 use crate::{
     actor::ActorTurn,
+    control::TraceOptions,
     envelope::Envelope,
     internal::panic_reason,
     types::{ActorId, ActorStatus, ExitReason},
 };
 
 use super::{
-    ActorCell, ConcurrentContext, RuntimeShared, apply_system_message_effects, take_next_envelope,
+    ActorCell, ConcurrentContext, ReservedActorMetadata, ReservedSystemResult, RuntimeShared,
+    apply_system_message_effects, handle_reserved_system_message, maybe_trace_receive,
+    take_next_envelope,
 };
 
 enum Either {
@@ -22,6 +25,8 @@ enum Either {
         envelope: Envelope,
         name: &'static str,
         scheduler_id: usize,
+        mailbox_len: usize,
+        trace_options: TraceOptions,
     },
     Wait(Arc<Notify>),
 }
@@ -58,11 +63,15 @@ pub(super) async fn run_actor_task(
                 entry.metrics.turns_run += 1;
                 let name = entry.name;
                 let scheduler_id = entry.scheduler_id;
+                let mailbox_len = entry.mailbox.len();
+                let trace_options = entry.trace_options;
                 state.metrics.normal_turns += 1;
                 Either::Envelope {
                     envelope,
                     name,
                     scheduler_id,
+                    mailbox_len,
+                    trace_options,
                 }
             } else {
                 entry.status = ActorStatus::Waiting;
@@ -83,7 +92,21 @@ pub(super) async fn run_actor_task(
                 envelope,
                 name,
                 scheduler_id,
+                mailbox_len,
+                trace_options,
             } => {
+                if trace_options.receives {
+                    maybe_trace_receive(
+                        &runtime,
+                        actor_id,
+                        name,
+                        trace_options,
+                        mailbox_len,
+                        scheduler_id,
+                        &envelope,
+                    );
+                }
+
                 let (turn_result, effects) = {
                     let envelope_kind = envelope.kind();
                     let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
@@ -95,8 +118,29 @@ pub(super) async fn run_actor_task(
                         envelope_kind = ?envelope_kind
                     );
                     let _turn_guard = turn_span.enter();
-                    let result =
-                        catch_unwind(AssertUnwindSafe(|| actor.handle(envelope, &mut ctx)));
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        if let Envelope::System(message) = envelope {
+                            match handle_reserved_system_message(
+                                &runtime,
+                                ReservedActorMetadata {
+                                    actor_id,
+                                    actor_name: name,
+                                    mailbox_len,
+                                    scheduler_id,
+                                },
+                                actor.as_mut(),
+                                message,
+                                &mut ctx,
+                            ) {
+                                ReservedSystemResult::Handled(turn) => turn,
+                                ReservedSystemResult::Forward(message) => {
+                                    actor.handle(Envelope::System(message), &mut ctx)
+                                }
+                            }
+                        } else {
+                            actor.handle(envelope, &mut ctx)
+                        }
+                    }));
                     let effects = ctx.finish();
                     (result, effects)
                 };

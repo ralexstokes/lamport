@@ -21,7 +21,7 @@ impl LocalRuntime {
         let (init_result, effects) = {
             let actor_id = entry.state.id;
             let actor_name = entry.name;
-            let mut ctx = LocalContext::new(self, &mut entry.state);
+            let mut ctx = LocalContext::new(self, &mut entry.state, entry.name);
             let init_span = tracing::debug_span!(
                 "lamport.actor.init",
                 actor_id = %actor_id,
@@ -75,7 +75,7 @@ impl LocalRuntime {
         let terminate_result = {
             let actor_id = entry.state.id;
             let actor_name = entry.name;
-            let mut ctx = LocalContext::new(self, &mut entry.state);
+            let mut ctx = LocalContext::new(self, &mut entry.state, entry.name);
             let terminate_span = tracing::debug_span!(
                 "lamport.actor.terminate",
                 actor_id = %actor_id,

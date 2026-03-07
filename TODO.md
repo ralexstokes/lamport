@@ -216,7 +216,7 @@ traffic.
 ## Suggested Order
 
 - [x] Finish the single-node control plane baseline (priority system-message delivery plus suspend/resume semantics).
-- Finish the remaining single-node control-plane features (`GetState`, `ReplaceState`, tracing control, code change, and unified external shutdown entrypoints).
+- [x] Finish the remaining single-node control-plane features (`GetState`, `ReplaceState`, tracing control, code change, and unified external shutdown entrypoints).
 - Finish the single-node receive API and mailbox-selection semantics.
 - Harden local ids/refs and introduce a future-proof local process-address type.
 

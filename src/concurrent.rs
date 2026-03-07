@@ -20,6 +20,7 @@ use crate::{
         ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
         SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
+    control::{ControlError, ControlResult, StateSnapshot, TraceOptions},
     envelope::{DownMessage, Envelope, Message, Payload, ReplyToken, TaskCompleted, TimerFired},
     internal::{
         ShutdownMode, ShutdownTracker, SupervisorRuntimeState, TurnEffects, actor_mailbox,
@@ -29,8 +30,8 @@ use crate::{
     mailbox::{Mailbox, MailboxFull},
     observability::{
         ActorTree, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
-        RuntimeMetricsSnapshot, build_actor_tree, build_metrics_snapshot,
-        build_runtime_introspection, emit_tracing_event, events_since,
+        RuntimeMetricsSnapshot, TraceEvent, TraceEventKind, build_actor_tree,
+        build_metrics_snapshot, build_runtime_introspection, emit_tracing_event, events_since,
     },
     registry::{Registry, RegistryError},
     scheduler::{
@@ -44,9 +45,24 @@ use crate::{
     },
 };
 
-trait ActorCell: Send {
+const SYSTEM_ACTOR_ID: ActorId = ActorId::new(u64::MAX, 0);
+
+pub(super) trait ActorCell: Send {
     fn init(&mut self, ctx: &mut ConcurrentContext) -> Result<(), ExitReason>;
     fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn;
+    fn state_version(&self) -> u64;
+    fn inspect_state(&mut self, ctx: &mut ConcurrentContext)
+    -> Result<StateSnapshot, ControlError>;
+    fn replace_state(
+        &mut self,
+        snapshot: StateSnapshot,
+        ctx: &mut ConcurrentContext,
+    ) -> Result<(), ControlError>;
+    fn code_change(
+        &mut self,
+        target_version: u64,
+        ctx: &mut ConcurrentContext,
+    ) -> Result<(), ControlError>;
     fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext);
 }
 
@@ -57,6 +73,33 @@ impl<A: Actor> ActorCell for A {
 
     fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn {
         Actor::handle(self, envelope, ctx)
+    }
+
+    fn state_version(&self) -> u64 {
+        Actor::state_version(self)
+    }
+
+    fn inspect_state(
+        &mut self,
+        ctx: &mut ConcurrentContext,
+    ) -> Result<StateSnapshot, ControlError> {
+        Actor::inspect_state(self, ctx)
+    }
+
+    fn replace_state(
+        &mut self,
+        snapshot: StateSnapshot,
+        ctx: &mut ConcurrentContext,
+    ) -> Result<(), ControlError> {
+        Actor::replace_state(self, snapshot, ctx)
+    }
+
+    fn code_change(
+        &mut self,
+        target_version: u64,
+        ctx: &mut ConcurrentContext,
+    ) -> Result<(), ControlError> {
+        Actor::code_change(self, target_version, ctx)
     }
 
     fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext) {
@@ -74,6 +117,7 @@ struct ActorRecord {
     monitors_in: BTreeMap<Ref, ActorId>,
     monitors_out: BTreeMap<Ref, ActorId>,
     trap_exit: bool,
+    trace_options: TraceOptions,
     suspended: bool,
     status: ActorStatus,
     metrics: ActorMetrics,
@@ -107,6 +151,7 @@ impl ActorRecord {
             monitors_in: BTreeMap::new(),
             monitors_out: BTreeMap::new(),
             trap_exit: options.trap_exit,
+            trace_options: TraceOptions::default(),
             suspended: false,
             status: ActorStatus::Starting,
             metrics: ActorMetrics::default(),
@@ -164,7 +209,7 @@ struct RuntimeState {
     metrics: SchedulerMetrics,
 }
 
-struct RuntimeShared {
+pub(super) struct RuntimeShared {
     config: SchedulerConfig,
     actor_handle: TokioHandle,
     cpu_handle: TokioHandle,
@@ -371,6 +416,67 @@ impl RuntimeShared {
     fn contains(&self, actor: ActorId) -> bool {
         let state = self.lock_state();
         Self::actor_matches(&state, actor)
+    }
+
+    fn request_shutdown(
+        self: &Arc<Self>,
+        requester: ActorId,
+        actor: ActorId,
+        policy: Shutdown,
+    ) -> Result<(), SendError> {
+        if !self.contains(actor) {
+            return Err(SendError::NoProc(actor));
+        }
+
+        {
+            let mut state = self.lock_state();
+            if !Self::actor_matches(&state, actor) {
+                return Err(SendError::NoProc(actor));
+            }
+
+            let prior =
+                Self::actor_mut(&mut state, actor).and_then(|target| target.shutdown.take());
+            if let Some(mut tracker) = prior
+                && let Some(task) = tracker.task.take()
+            {
+                task.abort();
+            }
+
+            Self::record_lifecycle_event(
+                &mut state,
+                LifecycleEvent::Shutdown {
+                    requester,
+                    actor,
+                    policy: policy.clone(),
+                    phase: ShutdownPhase::Requested,
+                    reason: None,
+                },
+            );
+
+            let task = match ShutdownMode::from_policy(&policy) {
+                ShutdownMode::ForceKill => None,
+                ShutdownMode::Linked {
+                    timeout: Some(delay),
+                } => Some(self.spawn_shutdown_timeout(actor, delay)),
+                ShutdownMode::Linked { timeout: None } => None,
+            };
+
+            let Some(target) = Self::actor_mut(&mut state, actor) else {
+                return Err(SendError::NoProc(actor));
+            };
+            target.shutdown = Some(ShutdownTracker::new(requester, policy.clone(), task));
+        }
+
+        match ShutdownMode::from_policy(&policy) {
+            ShutdownMode::ForceKill => {
+                self.request_force_exit(actor, ExitReason::Kill);
+            }
+            ShutdownMode::Linked { .. } => {
+                self.propagate_link_exit(actor, shutdown_signal(requester));
+            }
+        }
+
+        Ok(())
     }
 
     fn resolve_name(&self, name: &str) -> Option<ActorId> {
@@ -627,9 +733,13 @@ impl RuntimeShared {
         state.crash_reports.push(report.clone());
         Self::record_runtime_event(state, RuntimeEventKind::Crash(report));
     }
+
+    fn record_trace_event(state: &mut RuntimeState, event: TraceEvent) {
+        Self::record_runtime_event(state, RuntimeEventKind::Trace(event));
+    }
 }
 
-struct ConcurrentContext {
+pub(super) struct ConcurrentContext {
     runtime: Arc<RuntimeShared>,
     actor_id: ActorId,
     effects: TurnEffects,
@@ -665,7 +775,39 @@ impl ConcurrentContext {
     }
 
     fn send_to(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
+        self.maybe_trace_send(to, &envelope);
         self.runtime.enqueue_actor_envelope(to, envelope)
+    }
+
+    fn maybe_trace_send(&mut self, to: ActorId, envelope: &Envelope) {
+        let mut state = self.runtime.lock_state();
+        let Some(current) = RuntimeShared::actor_ref(&state, self.actor_id) else {
+            return;
+        };
+        if !current.trace_options.sends {
+            return;
+        }
+
+        let actor_id = current.id;
+        let actor_name = current.name;
+        let trace_options = current.trace_options;
+        let mailbox_len = current.mailbox.len();
+        let scheduler_id = Some(current.scheduler_id);
+
+        RuntimeShared::record_trace_event(
+            &mut state,
+            build_trace_event(
+                actor_id,
+                actor_name,
+                trace_options,
+                mailbox_len,
+                scheduler_id,
+                TraceEventKind::Sent {
+                    to,
+                    envelope_kind: envelope.kind(),
+                },
+            ),
+        );
     }
 
     fn enqueue_self_runtime_envelope(&mut self, envelope: Envelope, label: &'static str) {
@@ -988,60 +1130,7 @@ impl ActorContext for ConcurrentContext {
     }
 
     fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
-        if !self.runtime.contains(actor) {
-            return Err(SendError::NoProc(actor));
-        }
-
-        {
-            let mut state = self.runtime.lock_state();
-            if !RuntimeShared::actor_matches(&state, actor) {
-                return Err(SendError::NoProc(actor));
-            }
-
-            let prior = RuntimeShared::actor_mut(&mut state, actor)
-                .and_then(|target| target.shutdown.take());
-            if let Some(mut tracker) = prior
-                && let Some(task) = tracker.task.take()
-            {
-                task.abort();
-            }
-
-            RuntimeShared::record_lifecycle_event(
-                &mut state,
-                LifecycleEvent::Shutdown {
-                    requester: self.actor_id,
-                    actor,
-                    policy: policy.clone(),
-                    phase: ShutdownPhase::Requested,
-                    reason: None,
-                },
-            );
-
-            let task = match ShutdownMode::from_policy(&policy) {
-                ShutdownMode::ForceKill => None,
-                ShutdownMode::Linked {
-                    timeout: Some(delay),
-                } => Some(self.runtime.spawn_shutdown_timeout(actor, delay)),
-                ShutdownMode::Linked { timeout: None } => None,
-            };
-
-            let Some(target) = RuntimeShared::actor_mut(&mut state, actor) else {
-                return Err(SendError::NoProc(actor));
-            };
-            target.shutdown = Some(ShutdownTracker::new(self.actor_id, policy.clone(), task));
-        }
-
-        match ShutdownMode::from_policy(&policy) {
-            ShutdownMode::ForceKill => {
-                self.runtime.request_force_exit(actor, ExitReason::Kill);
-            }
-            ShutdownMode::Linked { .. } => {
-                self.runtime
-                    .propagate_link_exit(actor, shutdown_signal(self.actor_id));
-            }
-        }
-
-        Ok(())
+        self.runtime.request_shutdown(self.actor_id, actor, policy)
     }
 }
 
@@ -1132,13 +1221,244 @@ fn apply_system_message_effects(state: &mut ActorRecord, envelope: &Envelope) {
     match message {
         crate::envelope::SystemMessage::Suspend => state.suspended = true,
         crate::envelope::SystemMessage::Resume => state.suspended = false,
-        crate::envelope::SystemMessage::GetState
-        | crate::envelope::SystemMessage::ReplaceState(_)
-        | crate::envelope::SystemMessage::TraceOn
-        | crate::envelope::SystemMessage::TraceOff
+        crate::envelope::SystemMessage::GetState { .. }
+        | crate::envelope::SystemMessage::ReplaceState { .. }
+        | crate::envelope::SystemMessage::TraceOn { .. }
+        | crate::envelope::SystemMessage::TraceOff { .. }
         | crate::envelope::SystemMessage::Shutdown
-        | crate::envelope::SystemMessage::CodeChange => {}
+        | crate::envelope::SystemMessage::CodeChange { .. } => {}
     }
+}
+
+pub(super) enum ReservedSystemResult {
+    Handled(ActorTurn),
+    Forward(crate::envelope::SystemMessage),
+}
+
+pub(super) struct ReservedActorMetadata {
+    pub(super) actor_id: ActorId,
+    pub(super) actor_name: &'static str,
+    pub(super) mailbox_len: usize,
+    pub(super) scheduler_id: usize,
+}
+
+pub(super) fn handle_reserved_system_message(
+    runtime: &Arc<RuntimeShared>,
+    metadata: ReservedActorMetadata,
+    actor: &mut dyn ActorCell,
+    message: crate::envelope::SystemMessage,
+    ctx: &mut ConcurrentContext,
+) -> ReservedSystemResult {
+    let ReservedActorMetadata {
+        actor_id,
+        actor_name,
+        mailbox_len,
+        scheduler_id,
+    } = metadata;
+    match message {
+        crate::envelope::SystemMessage::GetState { reply } => {
+            match actor.inspect_state(ctx) {
+                Ok(snapshot) => {
+                    let version = snapshot.version;
+                    let sent = reply.send(Ok(snapshot)).is_ok();
+                    if sent {
+                        record_trace_for_actor(
+                            runtime,
+                            actor_id,
+                            actor_name,
+                            mailbox_len,
+                            scheduler_id,
+                            TraceEventKind::StateInspected { version },
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            ReservedSystemResult::Handled(ActorTurn::Continue)
+        }
+        crate::envelope::SystemMessage::ReplaceState {
+            state: snapshot,
+            reply,
+        } => {
+            let result = validate_snapshot_version(actor, &snapshot)
+                .and_then(|()| actor.replace_state(snapshot, ctx));
+            if result.is_ok() {
+                record_trace_for_actor(
+                    runtime,
+                    actor_id,
+                    actor_name,
+                    mailbox_len,
+                    scheduler_id,
+                    TraceEventKind::StateReplaced {
+                        version: actor.state_version(),
+                    },
+                );
+            }
+            let _ = reply.send(result);
+            ReservedSystemResult::Handled(ActorTurn::Continue)
+        }
+        crate::envelope::SystemMessage::TraceOn { options, reply } => {
+            update_trace_options(runtime, actor_id, options);
+            let mut shared = runtime.lock_state();
+            RuntimeShared::record_trace_event(
+                &mut shared,
+                build_trace_event(
+                    actor_id,
+                    actor_name,
+                    options,
+                    mailbox_len,
+                    Some(scheduler_id),
+                    TraceEventKind::TraceEnabled { options },
+                ),
+            );
+            let _ = reply.send(Ok(()));
+            ReservedSystemResult::Handled(ActorTurn::Continue)
+        }
+        crate::envelope::SystemMessage::TraceOff { reply } => {
+            if let Some(previous) = actor_trace_options(runtime, actor_id)
+                && previous.is_enabled()
+            {
+                let mut shared = runtime.lock_state();
+                RuntimeShared::record_trace_event(
+                    &mut shared,
+                    build_trace_event(
+                        actor_id,
+                        actor_name,
+                        previous,
+                        mailbox_len,
+                        Some(scheduler_id),
+                        TraceEventKind::TraceDisabled,
+                    ),
+                );
+            }
+            update_trace_options(runtime, actor_id, TraceOptions::default());
+            let _ = reply.send(Ok(()));
+            ReservedSystemResult::Handled(ActorTurn::Continue)
+        }
+        crate::envelope::SystemMessage::CodeChange {
+            target_version,
+            reply,
+        } => {
+            let from_version = actor.state_version();
+            let result = actor.code_change(target_version, ctx);
+            if result.is_ok() {
+                record_trace_for_actor(
+                    runtime,
+                    actor_id,
+                    actor_name,
+                    mailbox_len,
+                    scheduler_id,
+                    TraceEventKind::CodeChanged {
+                        from_version,
+                        to_version: target_version,
+                    },
+                );
+            }
+            let _ = reply.send(result);
+            ReservedSystemResult::Handled(ActorTurn::Continue)
+        }
+        other => ReservedSystemResult::Forward(other),
+    }
+}
+
+pub(super) fn maybe_trace_receive(
+    runtime: &Arc<RuntimeShared>,
+    actor: ActorId,
+    actor_name: &'static str,
+    trace_options: TraceOptions,
+    mailbox_len: usize,
+    scheduler_id: usize,
+    envelope: &Envelope,
+) {
+    let mut shared = runtime.lock_state();
+    RuntimeShared::record_trace_event(
+        &mut shared,
+        build_trace_event(
+            actor,
+            actor_name,
+            trace_options,
+            mailbox_len,
+            Some(scheduler_id),
+            TraceEventKind::Received {
+                envelope_kind: envelope.kind(),
+            },
+        ),
+    );
+}
+
+fn validate_snapshot_version(
+    actor: &dyn ActorCell,
+    snapshot: &StateSnapshot,
+) -> Result<(), ControlError> {
+    let current = actor.state_version();
+    if current == snapshot.version {
+        Ok(())
+    } else {
+        Err(ControlError::VersionMismatch {
+            current,
+            requested: snapshot.version,
+        })
+    }
+}
+
+fn build_trace_event(
+    actor: ActorId,
+    actor_name: &'static str,
+    options: TraceOptions,
+    mailbox_len: usize,
+    scheduler_id: Option<usize>,
+    kind: TraceEventKind,
+) -> TraceEvent {
+    TraceEvent {
+        actor,
+        actor_name,
+        kind,
+        mailbox_len: options.mailbox_depth.then_some(mailbox_len),
+        scheduler_id: options.scheduler.then_some(scheduler_id).flatten(),
+    }
+}
+
+fn actor_trace_options(runtime: &Arc<RuntimeShared>, actor: ActorId) -> Option<TraceOptions> {
+    let state = runtime.lock_state();
+    RuntimeShared::actor_ref(&state, actor).map(|entry| entry.trace_options)
+}
+
+fn update_trace_options(runtime: &Arc<RuntimeShared>, actor: ActorId, options: TraceOptions) {
+    let mut state = runtime.lock_state();
+    if let Some(entry) = RuntimeShared::actor_mut(&mut state, actor) {
+        entry.trace_options = options;
+    }
+}
+
+fn record_trace_for_actor(
+    runtime: &Arc<RuntimeShared>,
+    actor: ActorId,
+    actor_name: &'static str,
+    mailbox_len: usize,
+    scheduler_id: usize,
+    kind: TraceEventKind,
+) {
+    let Some(options) = actor_trace_options(runtime, actor) else {
+        return;
+    };
+    if !options.is_enabled() {
+        return;
+    }
+
+    let mut state = runtime.lock_state();
+    RuntimeShared::record_trace_event(
+        &mut state,
+        build_trace_event(
+            actor,
+            actor_name,
+            options,
+            mailbox_len,
+            Some(scheduler_id),
+            kind,
+        ),
+    );
 }
 
 /// A Tokio-backed multicore runtime that preserves Lamport's mailbox and supervision semantics.
@@ -1147,6 +1467,15 @@ pub struct ConcurrentRuntime {
     actor_runtime: Option<TokioRuntime>,
     cpu_runtime: Option<TokioRuntime>,
     inner: Arc<RuntimeShared>,
+}
+
+fn map_send_error(actor: ActorId, error: SendError, operation: &'static str) -> ControlError {
+    match error {
+        SendError::NoProc(_) => ControlError::NoProc(actor),
+        SendError::MailboxFull { .. } => {
+            ControlError::rejected(operation, "control mailbox delivery was backpressured")
+        }
+    }
 }
 
 impl Default for ConcurrentRuntime {
@@ -1313,6 +1642,63 @@ impl ConcurrentRuntime {
         self.send_envelope(to, Envelope::System(message))
     }
 
+    /// Requests runtime-managed shutdown using the same path as supervisors.
+    pub fn shutdown_actor(&self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
+        self.inner.request_shutdown(SYSTEM_ACTOR_ID, actor, policy)
+    }
+
+    /// Retrieves a type-erased actor state snapshot through the reserved control lane.
+    pub fn get_state(&self, actor: ActorId) -> ControlResult<StateSnapshot> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.send_system(actor, crate::envelope::SystemMessage::GetState { reply })
+            .map_err(|error| map_send_error(actor, error, "GetState"))?;
+        self.wait_for_control_reply(actor, "GetState", rx)
+    }
+
+    /// Replaces actor state through the reserved control lane.
+    pub fn replace_state(&self, actor: ActorId, state: StateSnapshot) -> ControlResult<()> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.send_system(
+            actor,
+            crate::envelope::SystemMessage::ReplaceState { state, reply },
+        )
+        .map_err(|error| map_send_error(actor, error, "ReplaceState"))?;
+        self.wait_for_control_reply(actor, "ReplaceState", rx)
+    }
+
+    /// Enables actor-scoped tracing through the reserved control lane.
+    pub fn trace_actor(&self, actor: ActorId, options: TraceOptions) -> ControlResult<()> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.send_system(
+            actor,
+            crate::envelope::SystemMessage::TraceOn { options, reply },
+        )
+        .map_err(|error| map_send_error(actor, error, "TraceOn"))?;
+        self.wait_for_control_reply(actor, "TraceOn", rx)
+    }
+
+    /// Disables actor-scoped tracing through the reserved control lane.
+    pub fn untrace_actor(&self, actor: ActorId) -> ControlResult<()> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.send_system(actor, crate::envelope::SystemMessage::TraceOff { reply })
+            .map_err(|error| map_send_error(actor, error, "TraceOff"))?;
+        self.wait_for_control_reply(actor, "TraceOff", rx)
+    }
+
+    /// Runs an actor-defined code-change hook through the reserved control lane.
+    pub fn code_change_actor(&self, actor: ActorId, target_version: u64) -> ControlResult<()> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.send_system(
+            actor,
+            crate::envelope::SystemMessage::CodeChange {
+                target_version,
+                reply,
+            },
+        )
+        .map_err(|error| map_send_error(actor, error, "CodeChange"))?;
+        self.wait_for_control_reply(actor, "CodeChange", rx)
+    }
+
     /// Suspends normal user-envelope execution for the actor.
     pub fn suspend_actor(&self, actor: ActorId) -> Result<(), SendError> {
         self.send_system(actor, crate::envelope::SystemMessage::Suspend)
@@ -1417,6 +1803,31 @@ impl ConcurrentRuntime {
     /// Returns whether the actor id refers to a live actor.
     pub fn contains(&self, actor: ActorId) -> bool {
         self.inner.contains(actor)
+    }
+
+    fn wait_for_control_reply<T>(
+        &self,
+        actor: ActorId,
+        operation: &'static str,
+        rx: std::sync::mpsc::Receiver<ControlResult<T>>,
+    ) -> ControlResult<T> {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if self.contains(actor) {
+                    Err(ControlError::rejected(
+                        operation,
+                        "control request timed out waiting for a reply",
+                    ))
+                } else {
+                    Err(ControlError::NoProc(actor))
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ControlError::rejected(
+                operation,
+                "control response channel closed",
+            )),
+        }
     }
 
     fn completed_actor_count(&self) -> usize {
@@ -1593,10 +2004,11 @@ mod tests {
     };
 
     use crate::{
-        Actor, ActorTurn, Context, Envelope, ExitReason, LifecycleEvent, PoolKind, Ref,
-        SchedulerConfig, SendError, SpawnError, SpawnOptions, SystemMessage, TimerToken,
+        Actor, ActorTurn, Context, ControlError, Envelope, ExitReason, LifecycleEvent, PoolKind,
+        Ref, SchedulerConfig, SendError, Shutdown, SpawnError, SpawnOptions, StateSnapshot,
+        SystemMessage, TimerToken, TraceOptions,
         envelope::{DownMessage, ExitSignal},
-        observability::RuntimeEventKind,
+        observability::{RuntimeEventKind, TraceEventKind},
     };
 
     use super::ConcurrentRuntime;
@@ -1606,6 +2018,62 @@ mod tests {
     impl Actor for SinkActor {
         fn handle<C: Context>(&mut self, _envelope: Envelope, _ctx: &mut C) -> ActorTurn {
             ActorTurn::Continue
+        }
+    }
+
+    struct ControlledActor {
+        value: i32,
+        version: u64,
+    }
+
+    impl Actor for ControlledActor {
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            if let Envelope::User(payload) = envelope {
+                self.value += payload.downcast::<i32>().ok().unwrap();
+            }
+
+            ActorTurn::Continue
+        }
+
+        fn state_version(&self) -> u64 {
+            self.version
+        }
+
+        fn inspect_state<C: Context>(
+            &mut self,
+            _ctx: &mut C,
+        ) -> Result<StateSnapshot, ControlError> {
+            Ok(StateSnapshot::new(self.version, self.value))
+        }
+
+        fn replace_state<C: Context>(
+            &mut self,
+            snapshot: StateSnapshot,
+            _ctx: &mut C,
+        ) -> Result<(), ControlError> {
+            self.value = match snapshot.payload.downcast::<i32>() {
+                Ok(value) => value,
+                Err(payload) => {
+                    return Err(ControlError::invalid_state("i32", payload.type_name()));
+                }
+            };
+            Ok(())
+        }
+
+        fn code_change<C: Context>(
+            &mut self,
+            target_version: u64,
+            _ctx: &mut C,
+        ) -> Result<(), ControlError> {
+            match (self.version, target_version) {
+                (current, requested) if current == requested => Ok(()),
+                (0, 1) => {
+                    self.value *= 10;
+                    self.version = 1;
+                    Ok(())
+                }
+                (current, requested) => Err(ControlError::VersionMismatch { current, requested }),
+            }
         }
     }
 
@@ -2128,5 +2596,90 @@ mod tests {
         let rendered = crash.to_string();
         assert!(rendered.contains("parent:"));
         assert!(rendered.contains("ancestors:"));
+    }
+
+    #[test]
+    fn control_plane_supports_state_tracing_code_change_and_external_shutdown() {
+        let runtime = ConcurrentRuntime::default();
+        let actor = runtime
+            .spawn(ControlledActor {
+                value: 1,
+                version: 0,
+            })
+            .unwrap();
+
+        runtime.send(actor, 2_i32).unwrap();
+        let snapshot = runtime.get_state(actor).unwrap();
+        assert_eq!(snapshot.version, 0);
+        assert_eq!(snapshot.payload.downcast::<i32>().ok().unwrap(), 1);
+
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        let snapshot = runtime.get_state(actor).unwrap();
+        assert_eq!(snapshot.payload.downcast::<i32>().ok().unwrap(), 3);
+
+        runtime
+            .replace_state(actor, StateSnapshot::new(0, 10_i32))
+            .unwrap();
+        let replaced = runtime.get_state(actor).unwrap();
+        assert_eq!(replaced.payload.downcast::<i32>().ok().unwrap(), 10);
+
+        let invalid = runtime.replace_state(actor, StateSnapshot::new(0, "bad"));
+        assert!(matches!(
+            invalid,
+            Err(ControlError::InvalidState {
+                expected: "i32",
+                actual: "&str"
+            })
+        ));
+
+        runtime.code_change_actor(actor, 1).unwrap();
+        let migrated = runtime.get_state(actor).unwrap();
+        assert_eq!(migrated.version, 1);
+        assert_eq!(migrated.payload.downcast::<i32>().ok().unwrap(), 100);
+
+        let rejected = runtime.code_change_actor(actor, 2);
+        assert!(matches!(
+            rejected,
+            Err(ControlError::VersionMismatch {
+                current: 1,
+                requested: 2
+            })
+        ));
+
+        runtime
+            .trace_actor(actor, TraceOptions::messages())
+            .unwrap();
+        runtime.send(actor, 1_i32).unwrap();
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        runtime.untrace_actor(actor).unwrap();
+
+        let events = runtime.event_log();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            RuntimeEventKind::Trace(trace)
+                if matches!(trace.kind, TraceEventKind::TraceEnabled { .. }) && trace.actor == actor
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            RuntimeEventKind::Trace(trace)
+                if matches!(
+                    trace.kind,
+                    TraceEventKind::Received {
+                        envelope_kind: crate::EnvelopeKind::User
+                    }
+                ) && trace.actor == actor
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            RuntimeEventKind::Trace(trace)
+                if matches!(trace.kind, TraceEventKind::TraceDisabled) && trace.actor == actor
+        )));
+
+        runtime.shutdown_actor(actor, Shutdown::Infinity).unwrap();
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        assert_eq!(
+            runtime.actor_snapshot(actor).unwrap().status,
+            crate::ActorStatus::Dead
+        );
     }
 }

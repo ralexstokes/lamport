@@ -1,6 +1,7 @@
 use crate::{
     actor::{Actor, ActorTurn},
     context::Context,
+    control::{ControlError, StateSnapshot},
     envelope::{Envelope, Message, Payload, ReplyToken},
     types::ExitReason,
 };
@@ -111,14 +112,49 @@ pub trait GenStatem: Send + 'static {
     ) {
     }
 
-    /// Runs during a future code-change flow.
+    /// Returns the control-plane state version for this behaviour.
+    fn state_version(&self) -> u64 {
+        0
+    }
+
+    /// Returns a type-erased snapshot for `GetState`.
+    fn inspect_state<C: Context>(
+        &mut self,
+        _state: &mut Self::State,
+        _data: &mut Self::Data,
+        _ctx: &mut C,
+    ) -> Result<Payload, ControlError> {
+        Err(ControlError::unsupported("GetState"))
+    }
+
+    /// Replaces state and data from a type-erased control payload.
+    fn replace_state<C: Context>(
+        &mut self,
+        _state: &mut Self::State,
+        _data: &mut Self::Data,
+        _replacement: Payload,
+        _ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        Err(ControlError::unsupported("ReplaceState"))
+    }
+
+    /// Runs during a reserved code-change flow.
     fn code_change<C: Context>(
         &mut self,
-        state: Self::State,
-        data: Self::Data,
+        _state: &mut Self::State,
+        _data: &mut Self::Data,
+        from_version: u64,
+        to_version: u64,
         _ctx: &mut C,
-    ) -> Result<(Self::State, Self::Data), ExitReason> {
-        Ok((state, data))
+    ) -> Result<(), ControlError> {
+        if from_version == to_version {
+            Ok(())
+        } else {
+            Err(ControlError::VersionMismatch {
+                current: from_version,
+                requested: to_version,
+            })
+        }
     }
 }
 
@@ -130,6 +166,7 @@ where
     machine: G,
     state: Option<G::State>,
     data: Option<G::Data>,
+    state_version: u64,
 }
 
 impl<G> GenStatemActor<G>
@@ -143,6 +180,7 @@ where
             machine,
             state: None,
             data: None,
+            state_version: 0,
         }
     }
 
@@ -153,6 +191,7 @@ where
             machine,
             state,
             data,
+            ..
         } = self;
         let (state, data) = initialized_pair(state, data, "gen statem state", "gen statem data")?;
         Ok((machine, state, data))
@@ -241,6 +280,7 @@ where
         let (state, data) = self.machine.init(ctx)?;
         self.state = Some(state);
         self.data = Some(data);
+        self.state_version = self.machine.state_version();
         Ok(())
     }
 
@@ -256,6 +296,43 @@ where
         if let (Some(state), Some(data)) = (self.state.as_mut(), self.data.as_mut()) {
             self.machine.terminate(state, data, reason, ctx);
         }
+    }
+
+    fn state_version(&self) -> u64 {
+        self.state_version
+    }
+
+    fn inspect_state<C: Context>(&mut self, ctx: &mut C) -> Result<StateSnapshot, ControlError> {
+        let (machine, state, data) = self
+            .machine_state_and_data_mut()
+            .map_err(|_| ControlError::rejected("GetState", "state machine is not initialized"))?;
+        let payload = machine.inspect_state(state, data, ctx)?;
+        Ok(StateSnapshot::from_payload(self.state_version, payload))
+    }
+
+    fn replace_state<C: Context>(
+        &mut self,
+        snapshot: StateSnapshot,
+        ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        let (machine, state, data) = self.machine_state_and_data_mut().map_err(|_| {
+            ControlError::rejected("ReplaceState", "state machine is not initialized")
+        })?;
+        machine.replace_state(state, data, snapshot.payload, ctx)
+    }
+
+    fn code_change<C: Context>(
+        &mut self,
+        target_version: u64,
+        ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        let from_version = self.state_version;
+        let (machine, state, data) = self.machine_state_and_data_mut().map_err(|_| {
+            ControlError::rejected("CodeChange", "state machine is not initialized")
+        })?;
+        machine.code_change(state, data, from_version, target_version, ctx)?;
+        self.state_version = target_version;
+        Ok(())
     }
 }
 

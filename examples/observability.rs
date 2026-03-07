@@ -5,6 +5,7 @@ use lamport::{
     SpawnOptions,
     observability::{
         ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
+        TraceEventKind,
     },
 };
 
@@ -252,6 +253,55 @@ fn print_events(events: &[RuntimeEvent]) {
             RuntimeEventKind::Crash(report) => {
                 println!("  #{} crash {}", event.sequence, report);
             }
+            RuntimeEventKind::Trace(trace) => match &trace.kind {
+                TraceEventKind::Sent { to, envelope_kind } => {
+                    println!(
+                        "  #{} trace-send actor={} to={} envelope={envelope_kind:?}",
+                        event.sequence, trace.actor, to
+                    );
+                }
+                TraceEventKind::Received { envelope_kind } => {
+                    println!(
+                        "  #{} trace-recv actor={} envelope={envelope_kind:?}",
+                        event.sequence, trace.actor
+                    );
+                }
+                TraceEventKind::TraceEnabled { options } => {
+                    println!(
+                        "  #{} trace-on actor={} sends={} receives={} mailbox_depth={} scheduler={}",
+                        event.sequence,
+                        trace.actor,
+                        options.sends,
+                        options.receives,
+                        options.mailbox_depth,
+                        options.scheduler
+                    );
+                }
+                TraceEventKind::TraceDisabled => {
+                    println!("  #{} trace-off actor={}", event.sequence, trace.actor);
+                }
+                TraceEventKind::StateInspected { version } => {
+                    println!(
+                        "  #{} trace-state actor={} version={version}",
+                        event.sequence, trace.actor
+                    );
+                }
+                TraceEventKind::StateReplaced { version } => {
+                    println!(
+                        "  #{} trace-replace actor={} version={version}",
+                        event.sequence, trace.actor
+                    );
+                }
+                TraceEventKind::CodeChanged {
+                    from_version,
+                    to_version,
+                } => {
+                    println!(
+                        "  #{} trace-code-change actor={} from={from_version} to={to_version}",
+                        event.sequence, trace.actor
+                    );
+                }
+            },
         }
     }
 }

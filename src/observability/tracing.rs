@@ -1,5 +1,6 @@
 use crate::{
     lifecycle::{LifecycleEvent, ShutdownPhase},
+    observability::{TraceEvent, TraceEventKind},
     types::ExitReason,
 };
 
@@ -54,6 +55,7 @@ pub(crate) fn emit_tracing_event(record: &RuntimeEvent) {
                 "actor crashed"
             );
         }
+        RuntimeEventKind::Trace(event) => emit_trace_event(record.sequence, event),
     }
 }
 
@@ -186,6 +188,85 @@ fn emit_shutdown(
             policy,
             phase,
             reason
+        ),
+    }
+}
+
+fn emit_trace_event(sequence: u64, event: &TraceEvent) {
+    match &event.kind {
+        TraceEventKind::Sent { to, envelope_kind } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::DEBUG,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            to = %to,
+            envelope_kind = ?envelope_kind,
+            mailbox_len = ?event.mailbox_len,
+            scheduler_id = ?event.scheduler_id,
+            "actor sent envelope"
+        ),
+        TraceEventKind::Received { envelope_kind } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::DEBUG,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            envelope_kind = ?envelope_kind,
+            mailbox_len = ?event.mailbox_len,
+            scheduler_id = ?event.scheduler_id,
+            "actor received envelope"
+        ),
+        TraceEventKind::TraceEnabled { options } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::INFO,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            sends = options.sends,
+            receives = options.receives,
+            mailbox_depth = options.mailbox_depth,
+            scheduler = options.scheduler,
+            "actor tracing enabled"
+        ),
+        TraceEventKind::TraceDisabled => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::INFO,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            "actor tracing disabled"
+        ),
+        TraceEventKind::StateInspected { version } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::DEBUG,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            version,
+            "actor state inspected"
+        ),
+        TraceEventKind::StateReplaced { version } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::INFO,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            version,
+            "actor state replaced"
+        ),
+        TraceEventKind::CodeChanged {
+            from_version,
+            to_version,
+        } => tracing::event!(
+            target: "lamport.trace",
+            tracing::Level::INFO,
+            sequence,
+            actor_id = %event.actor,
+            actor_name = event.actor_name,
+            from_version,
+            to_version,
+            "actor code change completed"
         ),
     }
 }

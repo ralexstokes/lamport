@@ -1,6 +1,7 @@
 use crate::{
     actor::{Actor, ActorTurn},
     context::Context,
+    control::{ControlError, StateSnapshot},
     envelope::{Envelope, Message, Payload, ReplyToken},
     types::ExitReason,
 };
@@ -92,13 +93,46 @@ pub trait GenServer: Send + 'static {
     ) {
     }
 
-    /// Runs during a future code-change flow.
+    /// Returns the control-plane state version for this behaviour.
+    fn state_version(&self) -> u64 {
+        0
+    }
+
+    /// Returns a type-erased snapshot for `GetState`.
+    fn inspect_state<C: Context>(
+        &mut self,
+        _state: &mut Self::State,
+        _ctx: &mut C,
+    ) -> Result<Payload, ControlError> {
+        Err(ControlError::unsupported("GetState"))
+    }
+
+    /// Replaces state from a type-erased control payload.
+    fn replace_state<C: Context>(
+        &mut self,
+        _state: &mut Self::State,
+        _replacement: Payload,
+        _ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        Err(ControlError::unsupported("ReplaceState"))
+    }
+
+    /// Runs during a reserved code-change flow.
     fn code_change<C: Context>(
         &mut self,
-        state: Self::State,
+        _state: &mut Self::State,
+        from_version: u64,
+        to_version: u64,
         _ctx: &mut C,
-    ) -> Result<Self::State, ExitReason> {
-        Ok(state)
+    ) -> Result<(), ControlError> {
+        if from_version == to_version {
+            Ok(())
+        } else {
+            Err(ControlError::VersionMismatch {
+                current: from_version,
+                requested: to_version,
+            })
+        }
     }
 }
 
@@ -110,6 +144,7 @@ where
 {
     server: G,
     state: Option<G::State>,
+    state_version: u64,
 }
 
 impl<G> GenServerActor<G>
@@ -123,11 +158,12 @@ where
         Self {
             server,
             state: None,
+            state_version: 0,
         }
     }
 
     fn server_and_state_mut(&mut self) -> Result<(&mut G, &mut G::State), ActorTurn> {
-        let Self { server, state } = self;
+        let Self { server, state, .. } = self;
         let state = initialized_state(state, "gen server state")?;
         Ok((server, state))
     }
@@ -202,6 +238,7 @@ where
 
     fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
         self.state = Some(self.server.init(ctx)?);
+        self.state_version = self.server.state_version();
         Ok(())
     }
 
@@ -217,6 +254,43 @@ where
         if let Some(state) = self.state.as_mut() {
             self.server.terminate(state, reason, ctx);
         }
+    }
+
+    fn state_version(&self) -> u64 {
+        self.state_version
+    }
+
+    fn inspect_state<C: Context>(&mut self, ctx: &mut C) -> Result<StateSnapshot, ControlError> {
+        let (server, state) = self
+            .server_and_state_mut()
+            .map_err(|_| ControlError::rejected("GetState", "server state is not initialized"))?;
+        let payload = server.inspect_state(state, ctx)?;
+        Ok(StateSnapshot::from_payload(self.state_version, payload))
+    }
+
+    fn replace_state<C: Context>(
+        &mut self,
+        snapshot: StateSnapshot,
+        ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        let (server, state) = self.server_and_state_mut().map_err(|_| {
+            ControlError::rejected("ReplaceState", "server state is not initialized")
+        })?;
+        server.replace_state(state, snapshot.payload, ctx)
+    }
+
+    fn code_change<C: Context>(
+        &mut self,
+        target_version: u64,
+        ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        let from_version = self.state_version;
+        let (server, state) = self
+            .server_and_state_mut()
+            .map_err(|_| ControlError::rejected("CodeChange", "server state is not initialized"))?;
+        server.code_change(state, from_version, target_version, ctx)?;
+        self.state_version = target_version;
+        Ok(())
     }
 }
 

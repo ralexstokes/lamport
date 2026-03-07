@@ -36,6 +36,7 @@ pub mod application;
 pub mod behaviour;
 pub mod concurrent;
 pub mod context;
+pub mod control;
 pub mod envelope;
 pub(crate) mod internal;
 pub mod lifecycle;
@@ -61,6 +62,7 @@ pub use context::{
     ActorContext, BehaviourContextExt, Context, LifecycleContext, LinkError, MonitorError,
     PendingCall, SendError, SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
 };
+pub use control::{ControlError, ControlResult, StateSnapshot, TraceOptions};
 pub use envelope::{
     CallTimedOut, DownMessage, Envelope, EnvelopeKind, ExitSignal, Message, Payload,
     RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, SystemMessage, TaskCompleted, TimerFired,

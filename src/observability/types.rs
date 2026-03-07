@@ -1,6 +1,8 @@
 use std::time::SystemTime;
 
 use crate::{
+    control::TraceOptions,
+    envelope::EnvelopeKind,
     lifecycle::{CrashReport, LifecycleEvent},
     scheduler::{RunQueueSnapshot, SchedulerMetrics},
     snapshot::ActorSnapshot,
@@ -47,6 +49,64 @@ pub enum RuntimeEventKind {
     Lifecycle(LifecycleEvent),
     /// Abnormal crash report emitted for an actor exit.
     Crash(CrashReport),
+    /// Actor-scoped trace event emitted when tracing is enabled.
+    Trace(TraceEvent),
+}
+
+/// Actor-scoped trace event captured through the control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEvent {
+    /// Actor producing or receiving the traceable action.
+    pub actor: ActorId,
+    /// Human-readable actor name.
+    pub actor_name: &'static str,
+    /// Trace payload.
+    pub kind: TraceEventKind,
+    /// Optional mailbox depth captured for the event.
+    pub mailbox_len: Option<usize>,
+    /// Optional scheduler id captured for the event.
+    pub scheduler_id: Option<usize>,
+}
+
+/// Supported trace payload variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceEventKind {
+    /// Actor sent an envelope to another actor.
+    Sent {
+        /// Destination actor.
+        to: ActorId,
+        /// Envelope kind sent by the actor.
+        envelope_kind: EnvelopeKind,
+    },
+    /// Actor received an envelope from its mailbox.
+    Received {
+        /// Envelope kind delivered to the actor.
+        envelope_kind: EnvelopeKind,
+    },
+    /// Actor tracing was enabled with the given options.
+    TraceEnabled {
+        /// Activated trace dimensions.
+        options: TraceOptions,
+    },
+    /// Actor tracing was disabled.
+    TraceDisabled,
+    /// State inspection completed successfully.
+    StateInspected {
+        /// Current actor state version.
+        version: u64,
+    },
+    /// State replacement completed successfully.
+    StateReplaced {
+        /// Current actor state version.
+        version: u64,
+    },
+    /// Reserved code change completed successfully.
+    CodeChanged {
+        /// Previous actor state version.
+        from_version: u64,
+        /// Requested target version.
+        to_version: u64,
+    },
 }
 
 /// Parent-child actor relationships for observer-style UIs.

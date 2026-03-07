@@ -1,9 +1,11 @@
 use std::{
     any::{Any, type_name},
     fmt,
+    sync::mpsc,
 };
 
 use crate::{
+    control::{ControlResult, StateSnapshot, TraceOptions},
     scheduler::PoolKind,
     types::{ActorId, ExitReason, Ref, TimerToken},
 };
@@ -141,17 +143,38 @@ pub enum SystemMessage {
     /// Resume user-message execution.
     Resume,
     /// Request a state snapshot from the actor.
-    GetState,
+    GetState {
+        /// Reply channel for the control result.
+        reply: mpsc::Sender<ControlResult<StateSnapshot>>,
+    },
     /// Replace the actor state in a controlled code-change path.
-    ReplaceState(Payload),
+    ReplaceState {
+        /// Replacement payload and version.
+        state: StateSnapshot,
+        /// Reply channel for the control result.
+        reply: mpsc::Sender<ControlResult<()>>,
+    },
     /// Enable tracing for the actor.
-    TraceOn,
+    TraceOn {
+        /// Tracing dimensions to enable.
+        options: TraceOptions,
+        /// Reply channel for the control result.
+        reply: mpsc::Sender<ControlResult<()>>,
+    },
     /// Disable tracing for the actor.
-    TraceOff,
+    TraceOff {
+        /// Reply channel for the control result.
+        reply: mpsc::Sender<ControlResult<()>>,
+    },
     /// Shutdown initiated by the runtime or supervisor.
     Shutdown,
     /// Trigger a code-change hook without carrying the new state directly.
-    CodeChange,
+    CodeChange {
+        /// Target version requested by the caller.
+        target_version: u64,
+        /// Reply channel for the control result.
+        reply: mpsc::Sender<ControlResult<()>>,
+    },
 }
 
 /// High-level envelope categories.
