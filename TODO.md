@@ -77,6 +77,14 @@ and code change.
   - Define what is guaranteed to run during orderly stop: terminate hooks,
     mailbox draining, final reports, and monitor/link notifications.
 
+- Add a real local upgrade workflow.
+  - `CodeChange` is only the actor-local hook; the runtime still needs an
+    upgrade story for supervisor trees and applications.
+  - Define quiescing, upgrade ordering, failure handling, and rollback or
+    restart behavior when one step of a local upgrade rejects or crashes.
+  - Decide how upgrade orchestration interacts with suspend/resume, pending
+    calls, and actor-selected receive loops.
+
 - Add control-plane observability and tests.
   - Test suspend/resume under load, shutdown during mailbox pressure, code
     change during pending calls, and tracing overhead.
@@ -142,6 +150,43 @@ Why this matters:
   purely local runtime.
 - It should be proven locally before adding network-induced races and failure
   modes.
+
+### 1.4 Nail Down Runtime-Originated Delivery And Finalization
+
+Goal: make runtime-owned traffic and actor teardown semantics explicit so local
+failure handling stays predictable under mailbox pressure and shutdown races.
+
+- Make mailbox reserve semantics explicit for all runtime-originated traffic.
+  - The reserve should apply not just to system messages, but also to replies,
+    task completions, call timeouts, exit signals, down notifications, and
+    timer events.
+  - Document the failure path when even the reserved capacity is exhausted
+    during runtime-owned delivery.
+
+- Define runtime-originated overflow handling.
+  - If reply, timeout, exit, down, timer, task, or system delivery still cannot
+    be queued, the runtime should fail in one well-defined way rather than
+    silently dropping or inconsistently retrying.
+  - Make the behavior consistent in both local and concurrent runtimes.
+
+- Tighten actor finalization guarantees.
+  - Define exactly what cleanup runs on exit: terminate hook invocation, timer
+    and call-timeout cancellation, link detachment, monitor notification,
+    registry cleanup, supervisor-child bookkeeping, and completed-snapshot
+    retention.
+  - Clarify which of those guarantees still hold after panic paths or forced
+    exit.
+
+- Add teardown and overflow tests.
+  - Cover runtime-originated delivery into nearly full mailboxes, cleanup after
+    shutdown and crash, and completed-snapshot lookup after death.
+
+Why this matters:
+
+- Runtime-owned delivery and teardown behavior are core single-node semantics,
+  not distributed follow-ons.
+- Later multi-node work depends on having one precise local story for failure,
+  overflow, and cleanup first.
 
 ## 2. Multi-Node Regime
 
@@ -220,6 +265,8 @@ traffic.
 - [x] Introduce actor-selected single-node receive primitives (`receive_next`, selective receive, and watermark-based reply matching).
 - [x] Add receive-timeout helpers and scheduler-yield guidance for longer selective-receive loops.
 - [x] Harden local ids/refs and introduce a future-proof local process-address type.
+- Add a real local upgrade workflow across supervisors and applications.
+- Nail down runtime-originated delivery overflow semantics and actor finalization guarantees.
 
 - Add node identity and connection management.
 - Add remote send/reply/monitor/link basics.
