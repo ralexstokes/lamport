@@ -27,10 +27,10 @@ jobs:
           test -n "$channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
-      - name: Install nightly rustfmt toolchain
+      - name: Install nightly toolchain for fmt and clippy
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt
+          components: clippy, rustfmt
 
       - name: Install Rust toolchain from rust-toolchain.toml
         uses: dtolnay/rust-toolchain@master
