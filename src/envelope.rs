@@ -179,16 +179,7 @@ pub enum EnvelopeKind {
 
 impl EnvelopeKind {
     pub(crate) const fn uses_runtime_reserve(self) -> bool {
-        matches!(
-            self,
-            Self::Reply
-                | Self::Task
-                | Self::CallTimeout
-                | Self::Exit
-                | Self::Down
-                | Self::Timer
-                | Self::System
-        )
+        !matches!(self, Self::User | Self::Request)
     }
 }
 

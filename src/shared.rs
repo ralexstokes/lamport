@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::Instant};
 use tokio::task::JoinHandle;
 
 use crate::{
-    runtime::{SupervisorChildSnapshot, SupervisorSnapshot},
+    snapshot::{SupervisorChildSnapshot, SupervisorSnapshot},
     supervisor::RestartIntensity,
     types::{ActorId, ChildSpec, ExitReason, Shutdown, SupervisorFlags},
 };
@@ -87,6 +87,6 @@ pub(crate) fn panic_reason(
 
 pub(crate) fn mailbox_overflow_reason(actor: ActorId, label: &str) -> ExitReason {
     ExitReason::Error(format!(
-        "actor `{actor:?}` mailbox overflow while delivering {label}"
+        "actor `{actor}` mailbox overflow while delivering {label}"
     ))
 }

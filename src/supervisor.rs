@@ -10,11 +10,9 @@ use crate::{
         TaskHandle, TimerError,
     },
     envelope::{Envelope, ExitSignal},
+    lifecycle::LifecycleEvent,
     registry::RegistryError,
-    types::{
-        ActorId, ChildSpec, ExitReason, LifecycleEvent, Ref, Shutdown, Strategy, SupervisorFlags,
-        TimerToken,
-    },
+    types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, Strategy, SupervisorFlags, TimerToken},
 };
 
 /// Failure to start a child from a supervisor.

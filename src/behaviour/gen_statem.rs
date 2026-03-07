@@ -1,0 +1,275 @@
+use crate::{
+    actor::{Actor, ActorTurn},
+    context::Context,
+    envelope::{Envelope, Message, Payload, ReplyToken},
+    types::ExitReason,
+};
+
+use super::{CastMessage, InfoMessage, RuntimeInfo, envelope_to_runtime_info};
+
+/// Outcome of handling a synchronous `GenStatem` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatemCallOutcome<S, R> {
+    /// Reply and keep the current state.
+    Reply(R),
+    /// Reply and transition to a new state.
+    ReplyAndTransition {
+        /// Reply sent to the caller.
+        reply: R,
+        /// Next state for the machine.
+        state: S,
+    },
+    /// Delay the reply and keep the current state.
+    NoReply,
+    /// Delay the reply and transition to a new state.
+    NoReplyAndTransition(S),
+    /// Reply and then stop with the given reason.
+    ReplyAndStop {
+        /// Reply sent to the caller.
+        reply: R,
+        /// Final exit reason for the machine.
+        reason: ExitReason,
+    },
+    /// Stop without sending a reply.
+    Stop(ExitReason),
+}
+
+/// Outcome of handling a `GenStatem` cast or info message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatemOutcome<S> {
+    /// Continue in the current state.
+    Continue,
+    /// Transition to a new state and continue.
+    Transition(S),
+    /// Yield after the current turn.
+    Yield,
+    /// Transition to a new state and yield.
+    TransitionAndYield(S),
+    /// Stop the machine.
+    Stop(ExitReason),
+}
+
+/// OTP-style typed state-machine behaviour layered on top of actors.
+pub trait GenStatem: Send + 'static {
+    /// Current state identifier for the machine.
+    type State: Send + 'static;
+    /// Mutable data carried across state transitions.
+    type Data: Send + 'static;
+    /// Synchronous request message type.
+    type Call: Message;
+    /// Async cast message type.
+    type Cast: Message;
+    /// Reply message type.
+    type Reply: Message;
+    /// Info message type, typically a user-defined enum over system events.
+    type Info: Message;
+
+    /// Initializes the machine and returns its starting state and data.
+    fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(Self::State, Self::Data), ExitReason>;
+
+    /// Handles a synchronous request in the current state.
+    fn handle_call<C: Context>(
+        &mut self,
+        state: &mut Self::State,
+        data: &mut Self::Data,
+        from: ReplyToken,
+        message: Self::Call,
+        ctx: &mut C,
+    ) -> StatemCallOutcome<Self::State, Self::Reply>;
+
+    /// Handles an async cast in the current state.
+    fn handle_cast<C: Context>(
+        &mut self,
+        state: &mut Self::State,
+        data: &mut Self::Data,
+        message: Self::Cast,
+        ctx: &mut C,
+    ) -> StatemOutcome<Self::State>;
+
+    /// Handles an info message such as a timer, exit, or down notification.
+    fn handle_info<C: Context>(
+        &mut self,
+        state: &mut Self::State,
+        data: &mut Self::Data,
+        message: Self::Info,
+        ctx: &mut C,
+    ) -> StatemOutcome<Self::State>;
+
+    /// Runs once when the machine terminates.
+    fn terminate<C: Context>(
+        &mut self,
+        _state: &mut Self::State,
+        _data: &mut Self::Data,
+        _reason: ExitReason,
+        _ctx: &mut C,
+    ) {
+    }
+
+    /// Runs during a future code-change flow.
+    fn code_change<C: Context>(
+        &mut self,
+        state: Self::State,
+        data: Self::Data,
+        _ctx: &mut C,
+    ) -> Result<(Self::State, Self::Data), ExitReason> {
+        Ok((state, data))
+    }
+}
+
+/// Actor adapter that makes a typed `GenStatem` spawnable on the raw runtime.
+pub struct GenStatemActor<G: GenStatem>
+where
+    G::Info: From<RuntimeInfo>,
+{
+    machine: G,
+    state: Option<G::State>,
+    data: Option<G::Data>,
+}
+
+impl<G> GenStatemActor<G>
+where
+    G: GenStatem,
+    G::Info: From<RuntimeInfo>,
+{
+    /// Wraps a typed state machine as a low-level actor.
+    pub fn new(machine: G) -> Self {
+        Self {
+            machine,
+            state: None,
+            data: None,
+        }
+    }
+
+    fn machine_state_and_data_mut(&mut self) -> (&mut G, &mut G::State, &mut G::Data) {
+        let Self {
+            machine,
+            state,
+            data,
+        } = self;
+        let state = state
+            .as_mut()
+            .expect("gen statem state must be initialized before handling messages");
+        let data = data
+            .as_mut()
+            .expect("gen statem data must be initialized before handling messages");
+        (machine, state, data)
+    }
+
+    fn handle_call<C: Context>(
+        &mut self,
+        token: ReplyToken,
+        message: Payload,
+        ctx: &mut C,
+    ) -> ActorTurn {
+        let call = match message.downcast::<G::Call>() {
+            Ok(call) => call,
+            Err(message) => {
+                return ActorTurn::Stop(ExitReason::Error(format!(
+                    "unexpected statem call payload `{}`",
+                    message.type_name()
+                )));
+            }
+        };
+
+        let (machine, state, data) = self.machine_state_and_data_mut();
+        match machine.handle_call(state, data, token, call, ctx) {
+            StatemCallOutcome::Reply(reply) => {
+                let _ = ctx.reply(token, reply);
+                ActorTurn::Continue
+            }
+            StatemCallOutcome::ReplyAndTransition { reply, state: next } => {
+                *state = next;
+                let _ = ctx.reply(token, reply);
+                ActorTurn::Continue
+            }
+            StatemCallOutcome::NoReply => ActorTurn::Continue,
+            StatemCallOutcome::NoReplyAndTransition(next) => {
+                *state = next;
+                ActorTurn::Continue
+            }
+            StatemCallOutcome::ReplyAndStop { reply, reason } => {
+                let _ = ctx.reply(token, reply);
+                ActorTurn::Stop(reason)
+            }
+            StatemCallOutcome::Stop(reason) => ActorTurn::Stop(reason),
+        }
+    }
+
+    fn handle_user<C: Context>(&mut self, payload: Payload, ctx: &mut C) -> ActorTurn {
+        match payload.downcast::<CastMessage<G::Cast>>() {
+            Ok(CastMessage(message)) => {
+                let (machine, state, data) = self.machine_state_and_data_mut();
+                let outcome = machine.handle_cast(state, data, message, ctx);
+                map_statem_outcome(state, outcome)
+            }
+            Err(payload) => match payload.downcast::<InfoMessage<G::Info>>() {
+                Ok(InfoMessage(message)) => {
+                    let (machine, state, data) = self.machine_state_and_data_mut();
+                    let outcome = machine.handle_info(state, data, message, ctx);
+                    map_statem_outcome(state, outcome)
+                }
+                Err(payload) => ActorTurn::Stop(ExitReason::Error(format!(
+                    "unexpected statem user payload `{}`",
+                    payload.type_name()
+                ))),
+            },
+        }
+    }
+
+    fn handle_runtime_info<C: Context>(&mut self, info: RuntimeInfo, ctx: &mut C) -> ActorTurn {
+        let (machine, state, data) = self.machine_state_and_data_mut();
+        let outcome = machine.handle_info(state, data, G::Info::from(info), ctx);
+        map_statem_outcome(state, outcome)
+    }
+}
+
+impl<G> Actor for GenStatemActor<G>
+where
+    G: GenStatem,
+    G::Info: From<RuntimeInfo>,
+{
+    fn name(&self) -> &'static str {
+        std::any::type_name::<G>()
+    }
+
+    fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+        let (state, data) = self.machine.init(ctx)?;
+        self.state = Some(state);
+        self.data = Some(data);
+        Ok(())
+    }
+
+    fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
+        match envelope {
+            Envelope::Request { token, message } => self.handle_call(token, message, ctx),
+            Envelope::User(payload) => self.handle_user(payload, ctx),
+            other => {
+                let info = envelope_to_runtime_info(other)
+                    .expect("all non-Request/User envelope variants are covered");
+                self.handle_runtime_info(info, ctx)
+            }
+        }
+    }
+
+    fn terminate<C: Context>(&mut self, reason: ExitReason, ctx: &mut C) {
+        if let (Some(state), Some(data)) = (self.state.as_mut(), self.data.as_mut()) {
+            self.machine.terminate(state, data, reason, ctx);
+        }
+    }
+}
+
+fn map_statem_outcome<S>(state: &mut S, outcome: StatemOutcome<S>) -> ActorTurn {
+    match outcome {
+        StatemOutcome::Continue => ActorTurn::Continue,
+        StatemOutcome::Transition(next) => {
+            *state = next;
+            ActorTurn::Continue
+        }
+        StatemOutcome::Yield => ActorTurn::Yield,
+        StatemOutcome::TransitionAndYield(next) => {
+            *state = next;
+            ActorTurn::Yield
+        }
+        StatemOutcome::Stop(reason) => ActorTurn::Stop(reason),
+    }
+}

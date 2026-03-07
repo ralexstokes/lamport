@@ -37,12 +37,14 @@ pub mod behaviour;
 pub mod concurrent;
 pub mod context;
 pub mod envelope;
+pub mod lifecycle;
 pub mod mailbox;
 pub mod observability;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
 pub(crate) mod shared;
+pub mod snapshot;
 pub mod supervisor;
 pub mod types;
 
@@ -63,21 +65,23 @@ pub use envelope::{
     CallTimedOut, DownMessage, Envelope, EnvelopeKind, ExitSignal, Message, Payload,
     RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, SystemMessage, TaskCompleted, TimerFired,
 };
+pub use lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase};
 pub use mailbox::{Mailbox, MailboxWatermark};
 pub use observability::{
-    ActorIdentity, ActorTree, ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind,
-    RuntimeIntrospection, RuntimeMetricsSnapshot,
+    ActorTree, ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
+    RuntimeMetricsSnapshot,
 };
 pub use registry::{Registry, RegistryError};
-pub use runtime::{ActorSnapshot, LocalRuntime, SupervisorChildSnapshot, SupervisorSnapshot};
+pub use runtime::LocalRuntime;
 pub use scheduler::{
     PoolKind, RunQueueSnapshot, ScheduleError, Scheduler, SchedulerConfig, SchedulerMetrics,
 };
+pub use snapshot::{ActorSnapshot, SupervisorChildSnapshot, SupervisorSnapshot};
 pub use supervisor::{
     RestartIntensity, StartChildError, Supervisor, SupervisorActor, SupervisorDirective,
     restart_scope,
 };
 pub use types::{
-    ActorId, ActorMetrics, ActorStatus, ChildSpec, CrashReport, ExitReason, LifecycleEvent, Ref,
-    Restart, Shutdown, ShutdownPhase, Strategy, SupervisorFlags, TimerToken,
+    ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Restart,
+    Shutdown, Strategy, SupervisorFlags, TimerToken,
 };
