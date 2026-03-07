@@ -4,13 +4,12 @@ use crate::{
     actor::Actor,
     behaviour::{GenServer, GenServerActor, GenStatem, GenStatemActor, RuntimeInfo},
     envelope::{Envelope, Message, ReplyToken},
+    lifecycle::LifecycleEvent,
     mailbox::MailboxWatermark,
     registry::RegistryError,
     scheduler::PoolKind,
     supervisor::{Supervisor, SupervisorActor},
-    types::{
-        ActorId, ChildSpec, ExitReason, LifecycleEvent, Ref, Shutdown, SupervisorFlags, TimerToken,
-    },
+    types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, SupervisorFlags, TimerToken},
 };
 
 /// Options applied when spawning a new actor.

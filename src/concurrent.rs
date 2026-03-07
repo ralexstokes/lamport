@@ -21,21 +21,22 @@ use crate::{
     envelope::{
         DownMessage, Envelope, ExitSignal, Message, Payload, ReplyToken, TaskCompleted, TimerFired,
     },
+    lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull},
     observability::{
-        ActorIdentity, ActorTree, EventCursor, RuntimeEvent, RuntimeEventKind,
-        RuntimeIntrospection, RuntimeMetricsSnapshot, build_actor_tree, build_metrics_snapshot,
+        ActorTree, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
+        RuntimeMetricsSnapshot, build_actor_tree, build_metrics_snapshot,
         build_runtime_introspection, emit_tracing_event, events_since,
     },
     registry::{Registry, RegistryError},
-    runtime::{ActorSnapshot, SupervisorSnapshot},
     scheduler::{
         PoolKind, RunQueueSnapshot, ScheduleError, Scheduler, SchedulerConfig, SchedulerMetrics,
     },
+    snapshot::{ActorSnapshot, SupervisorSnapshot},
     supervisor::{Supervisor, SupervisorActor},
     types::{
-        ActorId, ActorMetrics, ActorStatus, ChildSpec, CrashReport, ExitReason, LifecycleEvent,
-        Ref, Shutdown, ShutdownPhase, SupervisorFlags, TimerToken,
+        ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Shutdown,
+        SupervisorFlags, TimerToken,
     },
 };
 
@@ -298,7 +299,7 @@ impl RuntimeShared {
         }
 
         let runtime = Arc::clone(self);
-        std::mem::drop(
+        drop(
             self.actor_handle
                 .spawn(run_actor_task(runtime, actor_id, Box::new(actor))),
         );
@@ -888,7 +889,7 @@ impl ConcurrentContext {
         let runtime = self.runtime.clone();
         match pool {
             PoolKind::BlockingIo | PoolKind::Normal => {
-                std::mem::drop(self.runtime.actor_handle.spawn_blocking(move || {
+                drop(self.runtime.actor_handle.spawn_blocking(move || {
                     let result = job();
                     let _ = runtime.enqueue_runtime_envelope(
                         target,
@@ -902,7 +903,7 @@ impl ConcurrentContext {
                 }));
             }
             PoolKind::BlockingCpu => {
-                std::mem::drop(self.runtime.cpu_handle.spawn(async move {
+                drop(self.runtime.cpu_handle.spawn(async move {
                     let result = job();
                     let _ = runtime.enqueue_runtime_envelope(
                         target,
