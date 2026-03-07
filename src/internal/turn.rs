@@ -4,4 +4,5 @@ use crate::types::ExitReason;
 pub(crate) struct TurnEffects {
     pub(crate) exit_reason: Option<ExitReason>,
     pub(crate) yielded: bool,
+    pub(crate) claimed_envelope: bool,
 }

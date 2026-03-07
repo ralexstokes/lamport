@@ -65,6 +65,21 @@ impl PendingCall {
     }
 }
 
+/// An envelope claimed from the current actor mailbox for this turn.
+#[derive(Debug)]
+pub struct ReceivedEnvelope(Envelope);
+
+impl ReceivedEnvelope {
+    pub(crate) const fn new(envelope: Envelope) -> Self {
+        Self(envelope)
+    }
+
+    /// Consumes the claimed envelope so the runtime can deliver it to `handle`.
+    pub fn into_envelope(self) -> Envelope {
+        self.0
+    }
+}
+
 /// Handle for work dispatched onto a blocking pool.
 ///
 /// Completion is routed back to the originating actor as an `Envelope::Task`
@@ -186,6 +201,36 @@ pub trait ActorContext {
         message: M,
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError>;
+
+    /// Returns a watermark representing envelopes that will arrive in the future.
+    fn mailbox_watermark(&self) -> MailboxWatermark;
+
+    /// Claims the next mailbox envelope using the runtime's default delivery rules.
+    ///
+    /// Only one envelope may be claimed per actor turn.
+    fn receive_next(&mut self) -> Option<ReceivedEnvelope>;
+
+    /// Claims a mailbox envelope that matches the predicate.
+    ///
+    /// Reserved runtime traffic may bypass the predicate so actors cannot hide
+    /// critical control or failure signals behind selective receive.
+    /// Only one envelope may be claimed per actor turn.
+    fn receive_selective<F>(&mut self, predicate: F) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool;
+
+    /// Claims a matching envelope whose mailbox sequence is at or after the watermark.
+    ///
+    /// Reserved runtime traffic may bypass the predicate so actors cannot hide
+    /// critical control or failure signals behind selective receive.
+    /// Only one envelope may be claimed per actor turn.
+    fn receive_selective_after<F>(
+        &mut self,
+        watermark: MailboxWatermark,
+        predicate: F,
+    ) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool;
 
     /// Creates a bidirectional failure relationship with another actor.
     fn link(&mut self, other: ActorId) -> Result<(), LinkError>;

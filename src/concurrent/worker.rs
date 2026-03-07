@@ -3,11 +3,8 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::Notify;
-
 use crate::{
     actor::ActorTurn,
-    control::TraceOptions,
     envelope::Envelope,
     internal::panic_reason,
     types::{ActorId, ActorStatus, ExitReason},
@@ -16,20 +13,7 @@ use crate::{
 use super::{
     ActorCell, ConcurrentContext, ReservedActorMetadata, ReservedSystemResult, RuntimeShared,
     apply_system_message_effects, handle_reserved_system_message, maybe_trace_receive,
-    take_next_envelope,
 };
-
-enum Either {
-    Exit(ExitReason),
-    Envelope {
-        envelope: Envelope,
-        name: &'static str,
-        scheduler_id: usize,
-        mailbox_len: usize,
-        trace_options: TraceOptions,
-    },
-    Wait(Arc<Notify>),
-}
 
 pub(super) async fn run_actor_task(
     runtime: Arc<RuntimeShared>,
@@ -44,7 +28,7 @@ pub(super) async fn run_actor_task(
     let mut budget = 0_u32;
 
     loop {
-        let next = {
+        let forced_exit = {
             let mut state = runtime.lock_state();
             let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) else {
                 return;
@@ -54,133 +38,162 @@ pub(super) async fn run_actor_task(
                 entry.status = ActorStatus::Exiting;
                 entry.metrics.scheduler_id = Some(entry.scheduler_id);
                 runtime.idle_cv.notify_all();
-                Either::Exit(reason)
-            } else if let Some(envelope) = take_next_envelope(entry) {
-                apply_system_message_effects(entry, &envelope);
-                entry.metrics.mailbox_len = entry.mailbox.len();
-                entry.status = ActorStatus::Running;
-                entry.metrics.scheduler_id = Some(entry.scheduler_id);
-                entry.metrics.turns_run += 1;
-                let name = entry.name;
-                let scheduler_id = entry.scheduler_id;
-                let mailbox_len = entry.mailbox.len();
-                let trace_options = entry.trace_options;
-                state.metrics.normal_turns += 1;
-                Either::Envelope {
-                    envelope,
-                    name,
-                    scheduler_id,
-                    mailbox_len,
-                    trace_options,
-                }
+                Some(reason)
             } else {
-                entry.status = ActorStatus::Waiting;
-                entry.metrics.scheduler_id = None;
-                entry.metrics.mailbox_len = entry.mailbox.len();
-                let notify = Arc::clone(&entry.notify);
-                runtime.idle_cv.notify_all();
-                Either::Wait(notify)
+                None
             }
         };
 
-        match next {
-            Either::Exit(reason) => {
-                finish_actor_task(runtime, actor_id, actor, reason).await;
-                return;
-            }
-            Either::Envelope {
-                envelope,
-                name,
-                scheduler_id,
-                mailbox_len,
-                trace_options,
-            } => {
-                if trace_options.receives {
-                    maybe_trace_receive(
-                        &runtime,
-                        actor_id,
-                        name,
-                        trace_options,
-                        mailbox_len,
-                        scheduler_id,
-                        &envelope,
-                    );
-                }
+        if let Some(reason) = forced_exit {
+            finish_actor_task(runtime, actor_id, actor, reason).await;
+            return;
+        }
 
-                let (turn_result, effects) = {
-                    let envelope_kind = envelope.kind();
-                    let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
-                    let turn_span = tracing::trace_span!(
-                        "lamport.actor.turn",
-                        actor_id = %actor_id,
-                        actor_name = name,
-                        scheduler_id,
-                        envelope_kind = ?envelope_kind
-                    );
-                    let _turn_guard = turn_span.enter();
-                    let result = catch_unwind(AssertUnwindSafe(|| {
-                        if let Envelope::System(message) = envelope {
-                            match handle_reserved_system_message(
-                                &runtime,
-                                ReservedActorMetadata {
-                                    actor_id,
-                                    actor_name: name,
-                                    mailbox_len,
-                                    scheduler_id,
-                                },
-                                actor.as_mut(),
-                                message,
-                                &mut ctx,
-                            ) {
-                                ReservedSystemResult::Handled(turn) => turn,
-                                ReservedSystemResult::Forward(message) => {
-                                    actor.handle(Envelope::System(message), &mut ctx)
-                                }
-                            }
-                        } else {
-                            actor.handle(envelope, &mut ctx)
-                        }
-                    }));
-                    let effects = ctx.finish();
-                    (result, effects)
-                };
+        let (selection, effects) = {
+            let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
+            let selected = catch_unwind(AssertUnwindSafe(|| actor.select_envelope(&mut ctx)));
+            (selected, ctx.finish())
+        };
 
-                let exit_reason = match turn_result {
-                    Ok(turn) => effects.exit_reason.or(match turn {
-                        ActorTurn::Stop(reason) => Some(reason),
-                        ActorTurn::Continue | ActorTurn::Yield => None,
-                    }),
-                    Err(panic) => Some(panic_reason(actor_id, name, panic)),
-                };
-
-                if let Some(reason) = exit_reason {
+        let selected = match selection {
+            Ok(Some(selected)) => selected,
+            Ok(None) => {
+                if let Some(reason) = effects.exit_reason {
                     finish_actor_task(runtime, actor_id, actor, reason).await;
                     return;
                 }
 
-                {
+                let notify = {
                     let mut state = runtime.lock_state();
-                    if let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) {
-                        entry.metrics.mailbox_len = entry.mailbox.len();
-                        entry.metrics.scheduler_id = None;
-                        if entry.mailbox.is_empty() {
-                            entry.status = ActorStatus::Waiting;
-                        } else {
-                            entry.status = ActorStatus::Runnable;
+                    let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) else {
+                        return;
+                    };
+                    entry.status = ActorStatus::Waiting;
+                    entry.metrics.scheduler_id = None;
+                    entry.metrics.mailbox_len = entry.mailbox.len();
+                    Arc::clone(&entry.notify)
+                };
+                runtime.idle_cv.notify_all();
+                notify.notified().await;
+                continue;
+            }
+            Err(panic) => {
+                let name = {
+                    let state = runtime.lock_state();
+                    RuntimeShared::actor_ref(&state, actor_id)
+                        .map(|entry| entry.name)
+                        .unwrap_or("unknown")
+                };
+                finish_actor_task(
+                    runtime,
+                    actor_id,
+                    actor,
+                    panic_reason(actor_id, name, panic),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let envelope = selected.into_envelope();
+        let (name, scheduler_id, mailbox_len, trace_options) = {
+            let mut state = runtime.lock_state();
+            let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) else {
+                return;
+            };
+            apply_system_message_effects(entry, &envelope);
+            entry.metrics.mailbox_len = entry.mailbox.len();
+            entry.status = ActorStatus::Running;
+            entry.metrics.scheduler_id = Some(entry.scheduler_id);
+            entry.metrics.turns_run += 1;
+            let name = entry.name;
+            let scheduler_id = entry.scheduler_id;
+            let mailbox_len = entry.mailbox.len();
+            let trace_options = entry.trace_options;
+            state.metrics.normal_turns += 1;
+            (name, scheduler_id, mailbox_len, trace_options)
+        };
+
+        if trace_options.receives {
+            maybe_trace_receive(
+                &runtime,
+                actor_id,
+                name,
+                trace_options,
+                mailbox_len,
+                scheduler_id,
+                &envelope,
+            );
+        }
+
+        let (turn_result, effects) = {
+            let envelope_kind = envelope.kind();
+            let mut ctx = ConcurrentContext::new(Arc::clone(&runtime), actor_id);
+            let turn_span = tracing::trace_span!(
+                "lamport.actor.turn",
+                actor_id = %actor_id,
+                actor_name = name,
+                scheduler_id,
+                envelope_kind = ?envelope_kind
+            );
+            let _turn_guard = turn_span.enter();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                if let Envelope::System(message) = envelope {
+                    match handle_reserved_system_message(
+                        &runtime,
+                        ReservedActorMetadata {
+                            actor_id,
+                            actor_name: name,
+                            mailbox_len,
+                            scheduler_id,
+                        },
+                        actor.as_mut(),
+                        message,
+                        &mut ctx,
+                    ) {
+                        ReservedSystemResult::Handled(turn) => turn,
+                        ReservedSystemResult::Forward(message) => {
+                            actor.handle(Envelope::System(message), &mut ctx)
                         }
                     }
+                } else {
+                    actor.handle(envelope, &mut ctx)
                 }
-                runtime.idle_cv.notify_all();
+            }));
+            (result, ctx.finish())
+        };
 
-                budget += 1;
-                if effects.yielded || budget >= runtime.config.actor_turn_budget.max(1) {
-                    budget = 0;
-                    tokio::task::yield_now().await;
+        let exit_reason = match turn_result {
+            Ok(turn) => effects.exit_reason.or(match turn {
+                ActorTurn::Stop(reason) => Some(reason),
+                ActorTurn::Continue | ActorTurn::Yield => None,
+            }),
+            Err(panic) => Some(panic_reason(actor_id, name, panic)),
+        };
+
+        if let Some(reason) = exit_reason {
+            finish_actor_task(runtime, actor_id, actor, reason).await;
+            return;
+        }
+
+        {
+            let mut state = runtime.lock_state();
+            if let Some(entry) = RuntimeShared::actor_mut(&mut state, actor_id) {
+                entry.metrics.mailbox_len = entry.mailbox.len();
+                entry.metrics.scheduler_id = None;
+                if entry.mailbox.is_empty() {
+                    entry.status = ActorStatus::Waiting;
+                } else {
+                    entry.status = ActorStatus::Runnable;
                 }
             }
-            Either::Wait(notify) => {
-                notify.notified().await;
-            }
+        }
+        runtime.idle_cv.notify_all();
+
+        budget += 1;
+        if effects.yielded || budget >= runtime.config.actor_turn_budget.max(1) {
+            budget = 0;
+            tokio::task::yield_now().await;
         }
     }
 }

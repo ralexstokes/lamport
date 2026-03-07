@@ -217,7 +217,8 @@ traffic.
 
 - [x] Finish the single-node control plane baseline (priority system-message delivery plus suspend/resume semantics).
 - [x] Finish the remaining single-node control-plane features (`GetState`, `ReplaceState`, tracing control, code change, and unified external shutdown entrypoints).
-- Finish the single-node receive API and mailbox-selection semantics.
+- [x] Introduce actor-selected single-node receive primitives (`receive_next`, selective receive, and watermark-based reply matching).
+- Add receive-timeout helpers and scheduler-yield guidance for longer selective-receive loops.
 - Harden local ids/refs and introduce a future-proof local process-address type.
 
 - Add node identity and connection management.

@@ -3,11 +3,13 @@ use std::time::Duration;
 use crate::{
     actor::Actor,
     context::{
-        ActorContext, Context, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
-        SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
+        ActorContext, Context, LifecycleContext, LinkError, MonitorError, PendingCall,
+        ReceivedEnvelope, SendError, SpawnError, SpawnOptions, SupervisorContext, TaskHandle,
+        TimerError,
     },
     envelope::{Envelope, Message},
     lifecycle::LifecycleEvent,
+    mailbox::MailboxWatermark,
     registry::RegistryError,
     types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, SupervisorFlags, TimerToken},
 };
@@ -72,6 +74,32 @@ impl<C: Context> ActorContext for SupervisorChildContext<'_, C> {
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError> {
         self.inner.ask(to, message, timeout)
+    }
+
+    fn mailbox_watermark(&self) -> MailboxWatermark {
+        self.inner.mailbox_watermark()
+    }
+
+    fn receive_next(&mut self) -> Option<ReceivedEnvelope> {
+        self.inner.receive_next()
+    }
+
+    fn receive_selective<F>(&mut self, predicate: F) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        self.inner.receive_selective(predicate)
+    }
+
+    fn receive_selective_after<F>(
+        &mut self,
+        watermark: MailboxWatermark,
+        predicate: F,
+    ) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        self.inner.receive_selective_after(watermark, predicate)
     }
 
     fn link(&mut self, other: ActorId) -> Result<(), LinkError> {

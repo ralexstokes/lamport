@@ -297,6 +297,10 @@ impl Envelope {
     pub(crate) const fn can_run_while_suspended(&self) -> bool {
         matches!(self, Self::System(_) | Self::Exit(_) | Self::Down(_))
     }
+
+    pub(crate) const fn bypasses_user_selective_receive(&self) -> bool {
+        matches!(self, Self::System(_) | Self::Exit(_) | Self::Down(_))
+    }
 }
 
 #[cfg(test)]

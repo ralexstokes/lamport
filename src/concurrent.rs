@@ -17,8 +17,8 @@ use crate::{
     actor::{Actor, ActorTurn},
     behaviour::{GenServer, GenServerActor, GenStatem, GenStatemActor, RuntimeInfo},
     context::{
-        ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
-        SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
+        ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, ReceivedEnvelope,
+        SendError, SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
     control::{ControlError, ControlResult, StateSnapshot, TraceOptions},
     envelope::{DownMessage, Envelope, Message, Payload, ReplyToken, TaskCompleted, TimerFired},
@@ -27,7 +27,7 @@ use crate::{
         mailbox_overflow_reason, normalize_scheduler_config, shutdown_signal,
     },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
-    mailbox::{Mailbox, MailboxFull},
+    mailbox::{Mailbox, MailboxFull, MailboxWatermark},
     observability::{
         ActorTree, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
         RuntimeMetricsSnapshot, TraceEvent, TraceEventKind, build_actor_tree,
@@ -49,6 +49,7 @@ const SYSTEM_ACTOR_ID: ActorId = ActorId::new(u64::MAX, 0);
 
 pub(super) trait ActorCell: Send {
     fn init(&mut self, ctx: &mut ConcurrentContext) -> Result<(), ExitReason>;
+    fn select_envelope(&mut self, ctx: &mut ConcurrentContext) -> Option<ReceivedEnvelope>;
     fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn;
     fn state_version(&self) -> u64;
     fn inspect_state(&mut self, ctx: &mut ConcurrentContext)
@@ -69,6 +70,10 @@ pub(super) trait ActorCell: Send {
 impl<A: Actor> ActorCell for A {
     fn init(&mut self, ctx: &mut ConcurrentContext) -> Result<(), ExitReason> {
         Actor::init(self, ctx)
+    }
+
+    fn select_envelope(&mut self, ctx: &mut ConcurrentContext) -> Option<ReceivedEnvelope> {
+        Actor::select_envelope(self, ctx)
     }
 
     fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn {
@@ -1076,6 +1081,39 @@ impl ActorContext for ConcurrentContext {
         Ok(PendingCall::new(reply_to, watermark, timeout))
     }
 
+    fn mailbox_watermark(&self) -> MailboxWatermark {
+        self.actor_record(|actor| actor.mailbox.watermark())
+            .unwrap_or_else(|| MailboxWatermark::new(0))
+    }
+
+    fn receive_next(&mut self) -> Option<ReceivedEnvelope> {
+        if self.effects.claimed_envelope {
+            return None;
+        }
+
+        let envelope = self.actor_record_mut(take_next_envelope).flatten()?;
+        self.effects.claimed_envelope = true;
+        Some(ReceivedEnvelope::new(envelope))
+    }
+
+    fn receive_selective<F>(&mut self, predicate: F) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        self.receive_selective_after_inner(None, predicate)
+    }
+
+    fn receive_selective_after<F>(
+        &mut self,
+        watermark: MailboxWatermark,
+        predicate: F,
+    ) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        self.receive_selective_after_inner(Some(watermark), predicate)
+    }
+
     fn link(&mut self, other: ActorId) -> Result<(), LinkError> {
         self.link_inner(other)
     }
@@ -1131,6 +1169,27 @@ impl ActorContext for ConcurrentContext {
 
     fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
         self.runtime.request_shutdown(self.actor_id, actor, policy)
+    }
+}
+
+impl ConcurrentContext {
+    fn receive_selective_after_inner<F>(
+        &mut self,
+        watermark: Option<MailboxWatermark>,
+        predicate: F,
+    ) -> Option<ReceivedEnvelope>
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        if self.effects.claimed_envelope {
+            return None;
+        }
+
+        let envelope = self
+            .actor_record_mut(|actor| take_selective_envelope(actor, watermark, predicate))
+            .flatten()?;
+        self.effects.claimed_envelope = true;
+        Some(ReceivedEnvelope::new(envelope))
     }
 }
 
@@ -1211,6 +1270,39 @@ fn take_next_envelope(state: &mut ActorRecord) -> Option<Envelope> {
         .mailbox
         .selective_receive(Envelope::is_system_message)
         .or_else(|| state.mailbox.pop_front())
+}
+
+fn take_selective_envelope<F>(
+    state: &mut ActorRecord,
+    watermark: Option<MailboxWatermark>,
+    mut predicate: F,
+) -> Option<Envelope>
+where
+    F: FnMut(&Envelope) -> bool,
+{
+    if state.suspended {
+        return state
+            .mailbox
+            .selective_receive(Envelope::can_run_while_suspended);
+    }
+
+    if let Some(envelope) = state
+        .mailbox
+        .selective_receive(Envelope::bypasses_user_selective_receive)
+    {
+        return Some(envelope);
+    }
+
+    match watermark {
+        Some(watermark) => state
+            .mailbox
+            .selective_receive_after(watermark, |envelope| {
+                !envelope.bypasses_user_selective_receive() && predicate(envelope)
+            }),
+        None => state.mailbox.selective_receive(|envelope| {
+            !envelope.bypasses_user_selective_receive() && predicate(envelope)
+        }),
+    }
 }
 
 fn apply_system_message_effects(state: &mut ActorRecord, envelope: &Envelope) {
@@ -2005,13 +2097,33 @@ mod tests {
 
     use crate::{
         Actor, ActorTurn, Context, ControlError, Envelope, ExitReason, LifecycleEvent, PoolKind,
-        Ref, SchedulerConfig, SendError, Shutdown, SpawnError, SpawnOptions, StateSnapshot,
-        SystemMessage, TimerToken, TraceOptions,
+        ReceivedEnvelope, Ref, SchedulerConfig, SendError, Shutdown, SpawnError, SpawnOptions,
+        StateSnapshot, SystemMessage, TimerToken, TraceOptions,
         envelope::{DownMessage, ExitSignal},
         observability::{RuntimeEventKind, TraceEventKind},
     };
 
     use super::ConcurrentRuntime;
+
+    #[derive(Clone, PartialEq, Eq)]
+    enum Control {
+        Crash,
+    }
+
+    struct CrashActor;
+
+    impl Actor for CrashActor {
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            match envelope {
+                Envelope::User(payload)
+                    if payload.downcast_ref::<Control>() == Some(&Control::Crash) =>
+                {
+                    ActorTurn::Stop(ExitReason::Error("boom".into()))
+                }
+                _ => ActorTurn::Continue,
+            }
+        }
+    }
 
     struct SinkActor;
 
@@ -2191,6 +2303,108 @@ mod tests {
         }
     }
 
+    struct ReplyActor;
+
+    impl Actor for ReplyActor {
+        fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
+            if let Envelope::Request { token, message } = envelope {
+                let value = message.downcast::<u32>().ok().unwrap();
+                let _ = ctx.reply(token, value + 1);
+            }
+
+            ActorTurn::Continue
+        }
+    }
+
+    struct SelectiveReplyActor {
+        server: crate::ActorId,
+        seen: Arc<Mutex<Vec<String>>>,
+        pending: Option<crate::PendingCall>,
+    }
+
+    impl Actor for SelectiveReplyActor {
+        fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+            self.pending = Some(
+                ctx.ask(self.server, 41_u32, None)
+                    .map_err(|error| ExitReason::Error(format!("ask failed: {error:?}")))?,
+            );
+            ctx.send(ctx.actor_id(), 7_u32)
+                .map_err(|error| ExitReason::Error(format!("self-send failed: {error:?}")))?;
+            Ok(())
+        }
+
+        fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+            if let Some(pending) = self.pending {
+                return ctx.receive_selective_after(pending.mailbox_watermark, |envelope| {
+                    matches!(
+                        envelope,
+                        Envelope::Reply { reference, .. } if *reference == pending.reference
+                    ) || matches!(
+                        envelope,
+                        Envelope::CallTimeout(timeout) if timeout.reference == pending.reference
+                    )
+                });
+            }
+
+            ctx.receive_next()
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            let label = match envelope {
+                Envelope::Reply { reference, message } => {
+                    assert_eq!(
+                        Some(reference),
+                        self.pending.map(|pending| pending.reference)
+                    );
+                    self.pending = None;
+                    format!("reply:{}", message.downcast::<u32>().ok().unwrap())
+                }
+                Envelope::User(payload) => {
+                    format!("user:{}", payload.downcast::<u32>().ok().unwrap())
+                }
+                other => panic!("unexpected envelope: {other:?}"),
+            };
+
+            self.seen.lock().unwrap().push(label);
+            ActorTurn::Continue
+        }
+    }
+
+    struct SelectiveExitActor {
+        target: crate::ActorId,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Actor for SelectiveExitActor {
+        fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+            ctx.link(self.target)
+                .map_err(|error| ExitReason::Error(format!("link failed: {error:?}")))?;
+            Ok(())
+        }
+
+        fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+            ctx.receive_selective(|envelope| {
+                matches!(
+                    envelope,
+                    Envelope::User(payload) if payload.downcast_ref::<u32>() == Some(&99_u32)
+                )
+            })
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            if let Envelope::Exit(signal) = envelope {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("exit:{}", signal.reason));
+            } else {
+                panic!("unexpected envelope: {envelope:?}");
+            }
+
+            ActorTurn::Continue
+        }
+    }
+
     struct SuspendAwareActor {
         seen: Arc<Mutex<Vec<String>>>,
     }
@@ -2345,6 +2559,58 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, PoolKind::BlockingCpu);
         assert_eq!(seen[0].2, 42);
+    }
+
+    #[test]
+    fn actor_can_selectively_receive_pending_reply_after_watermark() {
+        let runtime = ConcurrentRuntime::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server = runtime.spawn(ReplyActor).unwrap();
+
+        runtime
+            .spawn(SelectiveReplyActor {
+                server,
+                seen: Arc::clone(&seen),
+                pending: None,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["reply:42", "user:7"]);
+    }
+
+    #[test]
+    fn selective_receive_still_delivers_link_exit_signals() {
+        let runtime = ConcurrentRuntime::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let crashing = runtime.spawn(CrashActor).unwrap();
+
+        runtime
+            .spawn_with_options(
+                SelectiveExitActor {
+                    target: crashing,
+                    seen: Arc::clone(&seen),
+                },
+                SpawnOptions {
+                    trap_exit: true,
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        runtime.send(crashing, Control::Crash).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["exit:error: boom"]);
     }
 
     #[test]

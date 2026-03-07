@@ -1,7 +1,7 @@
 use std::any::type_name;
 
 use crate::{
-    context::Context,
+    context::{Context, ReceivedEnvelope},
     control::{ControlError, StateSnapshot},
     envelope::Envelope,
     types::ExitReason,
@@ -33,6 +33,15 @@ pub trait Actor: Send + 'static {
     /// Runs once when the actor starts.
     fn init<C: Context>(&mut self, _ctx: &mut C) -> Result<(), ExitReason> {
         Ok(())
+    }
+
+    /// Claims the next envelope this actor wants to process for the current turn.
+    ///
+    /// The default implementation preserves the runtime's existing delivery
+    /// semantics. Actors that need selective receive can override this and use
+    /// the receive helpers on [`crate::Context`].
+    fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+        ctx.receive_next()
     }
 
     /// Handles exactly one delivered envelope.
