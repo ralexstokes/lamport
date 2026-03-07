@@ -143,27 +143,71 @@ impl RuntimeMetricsSnapshot {
             .unwrap_or_default()
             .as_secs_f64();
 
-        write_scalar_metric(
-            &mut output,
-            "lamport_runtime_observed_at_seconds",
-            "Unix timestamp when the runtime metrics snapshot was captured.",
-            "gauge",
-            observed_at,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_runtime_live_actors",
-            "Current number of live actors in the runtime.",
-            "gauge",
-            self.live_actors,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_runtime_completed_actors",
-            "Number of completed actor snapshots retained for introspection.",
-            "gauge",
-            self.completed_actors,
-        );
+        let scalars: &[(&str, &str, &str, &dyn fmt::Display)] = &[
+            (
+                "lamport_runtime_observed_at_seconds",
+                "Unix timestamp when the runtime metrics snapshot was captured.",
+                "gauge",
+                &observed_at,
+            ),
+            (
+                "lamport_runtime_live_actors",
+                "Current number of live actors in the runtime.",
+                "gauge",
+                &self.live_actors,
+            ),
+            (
+                "lamport_runtime_completed_actors",
+                "Number of completed actor snapshots retained for introspection.",
+                "gauge",
+                &self.completed_actors,
+            ),
+            (
+                "lamport_runtime_mailbox_messages",
+                "Total number of messages queued across live actor mailboxes.",
+                "gauge",
+                &self.total_mailbox_len,
+            ),
+            (
+                "lamport_runtime_mailbox_max_messages",
+                "Largest mailbox length across live actors.",
+                "gauge",
+                &self.max_mailbox_len,
+            ),
+            (
+                "lamport_scheduler_utilization_ratio",
+                "Estimated fraction of busy scheduler time over the runtime lifetime.",
+                "gauge",
+                &self.scheduler_metrics.utilization,
+            ),
+            (
+                "lamport_scheduler_normal_turns_total",
+                "Total actor turns executed on normal schedulers.",
+                "counter",
+                &self.scheduler_metrics.normal_turns,
+            ),
+            (
+                "lamport_scheduler_idle_turns_total",
+                "Total idle polling turns observed by schedulers.",
+                "counter",
+                &self.scheduler_metrics.idle_turns,
+            ),
+            (
+                "lamport_scheduler_blocking_io_jobs_total",
+                "Total jobs submitted to the blocking I/O pool.",
+                "counter",
+                &self.scheduler_metrics.blocking_io_jobs,
+            ),
+            (
+                "lamport_scheduler_blocking_cpu_jobs_total",
+                "Total jobs submitted to the blocking CPU pool.",
+                "counter",
+                &self.scheduler_metrics.blocking_cpu_jobs,
+            ),
+        ];
+        for (name, help, metric_type, value) in scalars {
+            write_scalar_metric(&mut output, name, help, metric_type, value);
+        }
 
         write_metric_header(
             &mut output,
@@ -187,56 +231,6 @@ impl RuntimeMetricsSnapshot {
                 value,
             );
         }
-
-        write_scalar_metric(
-            &mut output,
-            "lamport_runtime_mailbox_messages",
-            "Total number of messages queued across live actor mailboxes.",
-            "gauge",
-            self.total_mailbox_len,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_runtime_mailbox_max_messages",
-            "Largest mailbox length across live actors.",
-            "gauge",
-            self.max_mailbox_len,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_scheduler_utilization_ratio",
-            "Estimated fraction of busy scheduler time over the runtime lifetime.",
-            "gauge",
-            self.scheduler_metrics.utilization,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_scheduler_normal_turns_total",
-            "Total actor turns executed on normal schedulers.",
-            "counter",
-            self.scheduler_metrics.normal_turns,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_scheduler_idle_turns_total",
-            "Total idle polling turns observed by schedulers.",
-            "counter",
-            self.scheduler_metrics.idle_turns,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_scheduler_blocking_io_jobs_total",
-            "Total jobs submitted to the blocking I/O pool.",
-            "counter",
-            self.scheduler_metrics.blocking_io_jobs,
-        );
-        write_scalar_metric(
-            &mut output,
-            "lamport_scheduler_blocking_cpu_jobs_total",
-            "Total jobs submitted to the blocking CPU pool.",
-            "counter",
-            self.scheduler_metrics.blocking_cpu_jobs,
-        );
 
         write_metric_header(
             &mut output,
@@ -312,7 +306,8 @@ pub struct RuntimeIntrospection {
     pub metrics: RuntimeMetricsSnapshot,
 }
 
-pub(crate) fn build_actor_tree(mut actors: Vec<ActorSnapshot>) -> ActorTree {
+pub(crate) fn build_actor_tree(actors: &[ActorSnapshot]) -> ActorTree {
+    let mut actors = actors.to_vec();
     actors.sort_by_key(|snapshot| snapshot.id);
     let live_ids: BTreeSet<_> = actors.iter().map(|snapshot| snapshot.id).collect();
     let mut children_by_parent: BTreeMap<ActorId, Vec<ActorId>> = BTreeMap::new();
@@ -390,7 +385,7 @@ pub(crate) fn build_runtime_introspection(
     scheduler_metrics: SchedulerMetrics,
     run_queues: Vec<RunQueueSnapshot>,
 ) -> RuntimeIntrospection {
-    let actor_tree = build_actor_tree(actors.clone());
+    let actor_tree = build_actor_tree(&actors);
     let metrics = build_metrics_snapshot(&actors, completed_actors, scheduler_metrics, run_queues);
 
     RuntimeIntrospection {
@@ -545,16 +540,11 @@ pub(crate) fn emit_tracing_event(record: &RuntimeEvent) {
 }
 
 pub(crate) fn events_since(events: &[RuntimeEvent], cursor: &mut EventCursor) -> Vec<RuntimeEvent> {
-    let pending: Vec<_> = events
-        .iter()
-        .filter(|event| event.sequence >= cursor.next_sequence)
-        .cloned()
-        .collect();
-
+    let start = events.partition_point(|e| e.sequence < cursor.next_sequence);
+    let pending = events[start..].to_vec();
     if let Some(last) = pending.last() {
         cursor.next_sequence = last.sequence + 1;
     }
-
     pending
 }
 

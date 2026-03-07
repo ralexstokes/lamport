@@ -28,94 +28,39 @@ use crate::{
         build_runtime_introspection, emit_tracing_event, events_since,
     },
     registry::{Registry, RegistryError},
-    runtime::{ActorSnapshot, SupervisorChildSnapshot, SupervisorSnapshot},
+    runtime::{ActorSnapshot, SupervisorSnapshot},
     scheduler::{
         PoolKind, RunQueueSnapshot, ScheduleError, Scheduler, SchedulerConfig, SchedulerMetrics,
     },
-    supervisor::{RestartIntensity, Supervisor, SupervisorActor},
+    supervisor::{Supervisor, SupervisorActor},
     types::{
         ActorId, ActorMetrics, ActorStatus, ChildSpec, CrashReport, ExitReason, LifecycleEvent,
         Ref, Shutdown, ShutdownPhase, SupervisorFlags, TimerToken,
     },
 };
 
-#[derive(Debug, Clone)]
-struct SupervisorRuntimeState {
-    flags: SupervisorFlags,
-    child_specs: Vec<ChildSpec>,
-    running: BTreeMap<&'static str, ActorId>,
-    intensity: RestartIntensity,
-}
-
-impl SupervisorRuntimeState {
-    fn new(flags: SupervisorFlags, child_specs: Vec<ChildSpec>) -> Self {
-        Self {
-            flags: flags.clone(),
-            child_specs,
-            running: BTreeMap::new(),
-            intensity: RestartIntensity::new(flags),
-        }
-    }
-
-    fn set_running(&mut self, child_id: &'static str, actor: ActorId) {
-        self.running.insert(child_id, actor);
-    }
-
-    fn clear_running(&mut self, child_id: &'static str, actor: ActorId) {
-        if self.running.get(child_id).copied() == Some(actor) {
-            self.running.remove(child_id);
-        }
-    }
-
-    fn snapshot(&mut self, actor: ActorId) -> SupervisorSnapshot {
-        SupervisorSnapshot {
-            actor,
-            flags: self.flags.clone(),
-            children: self
-                .child_specs
-                .iter()
-                .cloned()
-                .map(|spec| SupervisorChildSnapshot {
-                    actor: self.running.get(spec.id).copied(),
-                    spec,
-                })
-                .collect(),
-            active_restarts: self.intensity.active_restarts(Instant::now()),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct TurnEffects {
-    exit_reason: Option<ExitReason>,
-    yielded: bool,
-}
+use crate::shared::{
+    ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason, panic_reason,
+};
 
 trait ActorCell: Send {
-    fn init(&mut self, ctx: &mut ConcurrentContext<'_>) -> Result<(), ExitReason>;
-    fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext<'_>) -> ActorTurn;
-    fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext<'_>);
+    fn init(&mut self, ctx: &mut ConcurrentContext) -> Result<(), ExitReason>;
+    fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn;
+    fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext);
 }
 
 impl<A: Actor> ActorCell for A {
-    fn init(&mut self, ctx: &mut ConcurrentContext<'_>) -> Result<(), ExitReason> {
+    fn init(&mut self, ctx: &mut ConcurrentContext) -> Result<(), ExitReason> {
         Actor::init(self, ctx)
     }
 
-    fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext<'_>) -> ActorTurn {
+    fn handle(&mut self, envelope: Envelope, ctx: &mut ConcurrentContext) -> ActorTurn {
         Actor::handle(self, envelope, ctx)
     }
 
-    fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext<'_>) {
+    fn terminate(&mut self, reason: ExitReason, ctx: &mut ConcurrentContext) {
         Actor::terminate(self, reason, ctx);
     }
-}
-
-#[derive(Debug)]
-struct ShutdownTracker {
-    requester: ActorId,
-    policy: Shutdown,
-    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -711,20 +656,18 @@ impl RuntimeShared {
     }
 }
 
-struct ConcurrentContext<'a> {
+struct ConcurrentContext {
     runtime: Arc<RuntimeShared>,
     actor_id: ActorId,
     effects: TurnEffects,
-    _scope: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> ConcurrentContext<'a> {
+impl ConcurrentContext {
     fn new(runtime: Arc<RuntimeShared>, actor_id: ActorId) -> Self {
         Self {
             runtime,
             actor_id,
             effects: TurnEffects::default(),
-            _scope: std::marker::PhantomData,
         }
     }
 
@@ -814,8 +757,6 @@ impl<'a> ConcurrentContext<'a> {
         if !current.links.insert(other) {
             return Err(LinkError::AlreadyLinked(other));
         }
-        let _ = current;
-
         state
             .actors
             .get_mut(&other.local_id)
@@ -980,7 +921,7 @@ impl<'a> ConcurrentContext<'a> {
     }
 }
 
-impl Context for ConcurrentContext<'_> {
+impl Context for ConcurrentContext {
     fn actor_id(&self) -> ActorId {
         self.actor_id
     }
@@ -1687,30 +1628,6 @@ fn normalize_config(mut config: SchedulerConfig) -> SchedulerConfig {
     config
 }
 
-fn panic_reason(
-    actor: ActorId,
-    name: &'static str,
-    payload: Box<dyn std::any::Any + Send>,
-) -> ExitReason {
-    let detail = payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| {
-            payload
-                .downcast_ref::<&'static str>()
-                .map(|message| (*message).to_owned())
-        })
-        .unwrap_or_else(|| "unknown panic".to_owned());
-
-    ExitReason::Error(format!("actor `{name}` ({actor}) panicked: {detail}"))
-}
-
-fn mailbox_overflow_reason(actor: ActorId, label: &str) -> ExitReason {
-    ExitReason::Error(format!(
-        "actor `{actor:?}` mailbox overflow while delivering {label}"
-    ))
-}
-
 /// A Tokio-backed multicore runtime that preserves Lamport's mailbox and supervision semantics.
 pub struct ConcurrentRuntime {
     config: SchedulerConfig,
@@ -1911,7 +1828,7 @@ impl ConcurrentRuntime {
 
     /// Returns the current live actor tree.
     pub fn actor_tree(&self) -> ActorTree {
-        build_actor_tree(self.actor_snapshots())
+        build_actor_tree(&self.actor_snapshots())
     }
 
     /// Returns an aggregate metrics snapshot suitable for production monitoring.
@@ -2041,7 +1958,7 @@ impl ConcurrentRuntime {
     pub fn metrics(&self) -> SchedulerMetrics {
         let mut metrics = {
             let state = self.inner.lock_state();
-            state.metrics.clone()
+            state.metrics
         };
 
         let runtime_metrics = self.inner.actor_handle.metrics();

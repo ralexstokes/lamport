@@ -288,6 +288,19 @@ where
     }
 }
 
+fn envelope_to_runtime_info(envelope: Envelope) -> Option<RuntimeInfo> {
+    match envelope {
+        Envelope::Reply { reference, message } => Some(RuntimeInfo::Reply { reference, message }),
+        Envelope::Task(task) => Some(RuntimeInfo::Task(task)),
+        Envelope::CallTimeout(timeout) => Some(RuntimeInfo::CallTimeout(timeout)),
+        Envelope::Exit(signal) => Some(RuntimeInfo::Exit(signal)),
+        Envelope::Down(message) => Some(RuntimeInfo::Down(message)),
+        Envelope::Timer(timer) => Some(RuntimeInfo::Timer(timer)),
+        Envelope::System(message) => Some(RuntimeInfo::System(message)),
+        _ => None,
+    }
+}
+
 impl<G> Actor for GenServerActor<G>
 where
     G: GenServer,
@@ -307,18 +320,10 @@ where
         match envelope {
             Envelope::Request { token, message } => self.handle_call(token, message, ctx),
             Envelope::User(payload) => self.handle_user(payload, ctx),
-            Envelope::Reply { reference, message } => {
-                self.handle_runtime_info(RuntimeInfo::Reply { reference, message }, ctx)
-            }
-            Envelope::Task(task) => self.handle_runtime_info(RuntimeInfo::Task(task), ctx),
-            Envelope::CallTimeout(timeout) => {
-                self.handle_runtime_info(RuntimeInfo::CallTimeout(timeout), ctx)
-            }
-            Envelope::Exit(signal) => self.handle_runtime_info(RuntimeInfo::Exit(signal), ctx),
-            Envelope::Down(message) => self.handle_runtime_info(RuntimeInfo::Down(message), ctx),
-            Envelope::Timer(timer) => self.handle_runtime_info(RuntimeInfo::Timer(timer), ctx),
-            Envelope::System(message) => {
-                self.handle_runtime_info(RuntimeInfo::System(message), ctx)
+            other => {
+                let info = envelope_to_runtime_info(other)
+                    .expect("all non-Request/User envelope variants are covered");
+                self.handle_runtime_info(info, ctx)
             }
         }
     }
@@ -350,18 +355,10 @@ where
         match envelope {
             Envelope::Request { token, message } => self.handle_call(token, message, ctx),
             Envelope::User(payload) => self.handle_user(payload, ctx),
-            Envelope::Reply { reference, message } => {
-                self.handle_runtime_info(RuntimeInfo::Reply { reference, message }, ctx)
-            }
-            Envelope::Task(task) => self.handle_runtime_info(RuntimeInfo::Task(task), ctx),
-            Envelope::CallTimeout(timeout) => {
-                self.handle_runtime_info(RuntimeInfo::CallTimeout(timeout), ctx)
-            }
-            Envelope::Exit(signal) => self.handle_runtime_info(RuntimeInfo::Exit(signal), ctx),
-            Envelope::Down(message) => self.handle_runtime_info(RuntimeInfo::Down(message), ctx),
-            Envelope::Timer(timer) => self.handle_runtime_info(RuntimeInfo::Timer(timer), ctx),
-            Envelope::System(message) => {
-                self.handle_runtime_info(RuntimeInfo::System(message), ctx)
+            other => {
+                let info = envelope_to_runtime_info(other)
+                    .expect("all non-Request/User envelope variants are covered");
+                self.handle_runtime_info(info, ctx)
             }
         }
     }

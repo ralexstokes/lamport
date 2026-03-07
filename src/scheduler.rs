@@ -77,7 +77,7 @@ pub struct RunQueueSnapshot {
 }
 
 /// Aggregate runtime metrics for Observer-style dashboards.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SchedulerMetrics {
     /// Ratio of busy to total scheduler time in the sample window.
     pub utilization: f32,

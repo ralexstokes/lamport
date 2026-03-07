@@ -42,6 +42,7 @@ pub mod observability;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
+pub(crate) mod shared;
 pub mod supervisor;
 pub mod types;
 

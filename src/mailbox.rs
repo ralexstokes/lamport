@@ -146,17 +146,12 @@ impl Mailbox {
         })
     }
 
-    fn remove_first_matching<F>(&mut self, mut predicate: F) -> Option<Envelope>
+    fn remove_first_matching<F>(&mut self, predicate: F) -> Option<Envelope>
     where
         F: FnMut(&QueuedEnvelope) -> bool,
     {
-        for index in 0..self.queue.len() {
-            if predicate(self.queue.get(index).expect("index within mailbox bounds")) {
-                return self.queue.remove(index).map(|entry| entry.envelope);
-            }
-        }
-
-        None
+        let index = self.queue.iter().position(predicate)?;
+        self.queue.remove(index).map(|entry| entry.envelope)
     }
 
     fn is_full_for(&self, kind: EnvelopeKind) -> bool {

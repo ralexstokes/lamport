@@ -122,7 +122,7 @@ mod tests {
 
     impl Supervisor for EmptyRootSupervisor {
         fn flags(&self) -> SupervisorFlags {
-            self.flags.clone()
+            self.flags
         }
 
         fn child_specs(&self) -> &[ChildSpec] {

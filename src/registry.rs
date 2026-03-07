@@ -55,10 +55,6 @@ impl Registry {
         }
 
         if let Some(existing_actor) = self.by_name.get(&name).copied() {
-            if existing_actor == actor {
-                return Ok(());
-            }
-
             return Err(RegistryError::NameTaken {
                 name,
                 actor: existing_actor,
