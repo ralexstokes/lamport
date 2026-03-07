@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::types::{ActorId, ChildSpec, ExitReason, SupervisorFlags};
+use crate::{
+    control::ControlError,
+    types::{ActorId, ChildSpec, ExitReason, SupervisorFlags},
+};
 
 #[derive(Debug)]
 pub(super) struct SupervisorActorState {
@@ -96,6 +99,24 @@ impl SupervisorActorState {
             .rev()
             .filter_map(|spec| self.running.contains_key(spec.id).then_some(spec.id))
             .collect()
+    }
+
+    pub(super) fn validate_reconfigure(&self, specs: &[ChildSpec]) -> Result<(), ControlError> {
+        let current_ids: Vec<_> = self.specs.iter().map(|spec| spec.id).collect();
+        let next_ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
+        if current_ids != next_ids {
+            return Err(ControlError::rejected(
+                "CodeChange",
+                "supervisor code change cannot add, remove, or reorder child ids",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn reconfigure(&mut self, flags: SupervisorFlags, specs: Vec<ChildSpec>) {
+        self.flags = flags;
+        self.specs = specs;
     }
 }
 

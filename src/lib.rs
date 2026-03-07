@@ -63,7 +63,10 @@ pub use context::{
     PendingCall, ReceiveTimeout, ReceivedEnvelope, SendError, SpawnError, SpawnOptions,
     SupervisorContext, TaskHandle, TimerError,
 };
-pub use control::{ControlError, ControlResult, StateSnapshot, TraceOptions};
+pub use control::{
+    ControlError, ControlResult, LocalUpgradeError, LocalUpgradeFailure, LocalUpgradeReport,
+    LocalUpgradeStage, StateSnapshot, TraceOptions,
+};
 pub use envelope::{
     CallTimedOut, DownMessage, Envelope, EnvelopeKind, ExitSignal, Message, Payload,
     RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, SystemMessage, TaskCompleted, TimerFired,

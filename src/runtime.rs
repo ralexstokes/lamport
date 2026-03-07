@@ -16,7 +16,10 @@ use crate::{
         ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, ReceivedEnvelope,
         SendError, SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
-    control::{ControlError, ControlResult, StateSnapshot, TraceOptions},
+    control::{
+        ControlError, ControlResult, LocalUpgradeError, LocalUpgradeFailure, LocalUpgradeReport,
+        LocalUpgradeStage, StateSnapshot, TraceOptions,
+    },
     envelope::{DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted, TimerFired},
     internal::{
         ActorSlotAllocator, ExitDisposition, ShutdownMode, ShutdownTracker, SupervisorRuntimeState,
@@ -222,6 +225,13 @@ struct LocalContext<'a> {
     current: &'a mut ActorState,
     current_name: &'static str,
     effects: TurnEffects,
+}
+
+#[derive(Debug)]
+struct LocalUpgradePlan {
+    suspend_order: Vec<ActorId>,
+    upgrade_order: Vec<ActorId>,
+    resume_targets: Vec<ActorId>,
 }
 
 impl<'a> LocalContext<'a> {
@@ -627,7 +637,12 @@ impl LocalContext<'_> {
 
 impl SupervisorContext for LocalContext<'_> {
     fn configure_supervisor(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
-        self.current.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
+        match self.current.supervisor.as_mut() {
+            Some(supervisor) => supervisor.reconfigure(flags, child_specs),
+            None => {
+                self.current.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
+            }
+        }
     }
 
     fn record_supervisor_restart(&mut self) -> bool {
@@ -748,6 +763,15 @@ impl LocalRuntime {
         let (name, options, root_supervisor) = crate::application::prepare_application(application);
         let root = self.spawn_supervisor_with_options(root_supervisor, options)?;
         Ok(crate::application::ApplicationHandle::new(name, root))
+    }
+
+    /// Upgrades a booted application's root supervisor tree through the local control plane.
+    pub fn upgrade_application(
+        &mut self,
+        handle: crate::application::ApplicationHandle,
+        target_version: u64,
+    ) -> Result<LocalUpgradeReport, LocalUpgradeError> {
+        self.upgrade_supervisor_tree(handle.root_supervisor(), target_version)
     }
 
     /// Returns the scheduler configuration used by the runtime.
@@ -923,6 +947,80 @@ impl LocalRuntime {
         )
         .map_err(|error| map_send_error(actor, error, "CodeChange"))?;
         self.wait_for_control_reply(actor, "CodeChange", rx)
+    }
+
+    /// Quiesces a live supervisor tree, upgrades leaves before parents, and resumes it.
+    pub fn upgrade_supervisor_tree(
+        &mut self,
+        root: ActorId,
+        target_version: u64,
+    ) -> Result<LocalUpgradeReport, LocalUpgradeError> {
+        let plan = self.plan_local_upgrade(root, target_version)?;
+        let mut suspended = Vec::new();
+        let mut upgraded = Vec::new();
+
+        for actor in &plan.resume_targets {
+            self.suspend_actor(*actor)
+                .map_err(|error| LocalUpgradeError {
+                    root,
+                    target_version,
+                    actor: Some(*actor),
+                    stage: Some(LocalUpgradeStage::Suspend),
+                    failure: Box::new(LocalUpgradeFailure::Send(error)),
+                    suspended: suspended.clone(),
+                    upgraded: upgraded.clone(),
+                })?;
+            suspended.push(*actor);
+        }
+        self.run_until_idle();
+
+        for actor in &plan.upgrade_order {
+            if !self.contains(*actor) {
+                let error = LocalUpgradeError {
+                    root,
+                    target_version,
+                    actor: Some(*actor),
+                    stage: Some(LocalUpgradeStage::CodeChange),
+                    failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                        actor: *actor,
+                        reason: "actor exited while the tree was quiesced".into(),
+                    }),
+                    suspended: suspended.clone(),
+                    upgraded: upgraded.clone(),
+                };
+                let _ = self.resume_upgrade_targets(root, target_version, &plan.resume_targets);
+                return Err(error);
+            }
+
+            if let Err(error) = self.code_change_actor(*actor, target_version) {
+                let failure = LocalUpgradeError {
+                    root,
+                    target_version,
+                    actor: Some(*actor),
+                    stage: Some(LocalUpgradeStage::CodeChange),
+                    failure: Box::new(LocalUpgradeFailure::Control(error)),
+                    suspended: suspended.clone(),
+                    upgraded: upgraded.clone(),
+                };
+                let _ = self.resume_upgrade_targets(root, target_version, &plan.resume_targets);
+                return Err(failure);
+            }
+            upgraded.push(*actor);
+        }
+
+        self.resume_upgrade_targets(root, target_version, &plan.resume_targets)
+            .map_err(|mut error| {
+                error.suspended = suspended.clone();
+                error.upgraded = upgraded.clone();
+                error
+            })?;
+
+        Ok(LocalUpgradeReport {
+            root,
+            target_version,
+            suspend_order: plan.suspend_order,
+            upgrade_order: plan.upgrade_order,
+        })
     }
 
     /// Suspends normal user-envelope execution for the actor.
@@ -1101,6 +1199,200 @@ impl LocalRuntime {
         self.actors
             .get(&actor.local_id)
             .is_some_and(|entry| entry.state.id == actor)
+    }
+
+    fn plan_local_upgrade(
+        &mut self,
+        root: ActorId,
+        target_version: u64,
+    ) -> Result<LocalUpgradePlan, LocalUpgradeError> {
+        if !self.contains(root) || self.supervisor_snapshot(root).is_none() {
+            return Err(LocalUpgradeError {
+                root,
+                target_version,
+                actor: None,
+                stage: None,
+                failure: Box::new(LocalUpgradeFailure::NotLiveSupervisor(root)),
+                suspended: Vec::new(),
+                upgraded: Vec::new(),
+            });
+        }
+
+        let mut plan = LocalUpgradePlan {
+            suspend_order: Vec::new(),
+            upgrade_order: Vec::new(),
+            resume_targets: Vec::new(),
+        };
+        self.collect_local_upgrade_tree(root, root, target_version, &mut plan)?;
+        Ok(plan)
+    }
+
+    fn collect_local_upgrade_tree(
+        &mut self,
+        actor: ActorId,
+        root: ActorId,
+        target_version: u64,
+        plan: &mut LocalUpgradePlan,
+    ) -> Result<(), LocalUpgradeError> {
+        let Some(snapshot) = self.actor_snapshot(actor) else {
+            return Err(LocalUpgradeError {
+                root,
+                target_version,
+                actor: None,
+                stage: None,
+                failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                    actor,
+                    reason: "actor disappeared while planning the upgrade".into(),
+                }),
+                suspended: Vec::new(),
+                upgraded: Vec::new(),
+            });
+        };
+        if !self.contains(actor) {
+            return Err(LocalUpgradeError {
+                root,
+                target_version,
+                actor: None,
+                stage: None,
+                failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                    actor,
+                    reason: "actor is no longer live".into(),
+                }),
+                suspended: Vec::new(),
+                upgraded: Vec::new(),
+            });
+        }
+
+        plan.suspend_order.push(actor);
+        if !snapshot.suspended {
+            plan.resume_targets.push(actor);
+        }
+
+        let children = self
+            .supervisor_snapshot(actor)
+            .ok_or_else(|| LocalUpgradeError {
+                root,
+                target_version,
+                actor: None,
+                stage: None,
+                failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                    actor,
+                    reason: "expected a live supervisor while planning the upgrade".into(),
+                }),
+                suspended: Vec::new(),
+                upgraded: Vec::new(),
+            })?
+            .children;
+
+        for child in children {
+            let Some(child_actor) = child.actor else {
+                continue;
+            };
+
+            if child.spec.is_supervisor {
+                if self.supervisor_snapshot(child_actor).is_none() {
+                    return Err(LocalUpgradeError {
+                        root,
+                        target_version,
+                        actor: None,
+                        stage: None,
+                        failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                            actor: child_actor,
+                            reason: format!(
+                                "child `{}` is marked as a supervisor but is not running one",
+                                child.spec.id
+                            ),
+                        }),
+                        suspended: Vec::new(),
+                        upgraded: Vec::new(),
+                    });
+                }
+
+                self.collect_local_upgrade_tree(child_actor, root, target_version, plan)?;
+            } else {
+                if self.supervisor_snapshot(child_actor).is_some() {
+                    return Err(LocalUpgradeError {
+                        root,
+                        target_version,
+                        actor: None,
+                        stage: None,
+                        failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                            actor: child_actor,
+                            reason: format!(
+                                "child `{}` is a supervisor subtree but its spec marks it as a worker",
+                                child.spec.id
+                            ),
+                        }),
+                        suspended: Vec::new(),
+                        upgraded: Vec::new(),
+                    });
+                }
+
+                let Some(child_snapshot) = self.actor_snapshot(child_actor) else {
+                    return Err(LocalUpgradeError {
+                        root,
+                        target_version,
+                        actor: None,
+                        stage: None,
+                        failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                            actor: child_actor,
+                            reason: "child disappeared while planning the upgrade".into(),
+                        }),
+                        suspended: Vec::new(),
+                        upgraded: Vec::new(),
+                    });
+                };
+                if !self.contains(child_actor) {
+                    return Err(LocalUpgradeError {
+                        root,
+                        target_version,
+                        actor: None,
+                        stage: None,
+                        failure: Box::new(LocalUpgradeFailure::InvalidTree {
+                            actor: child_actor,
+                            reason: "child is no longer live".into(),
+                        }),
+                        suspended: Vec::new(),
+                        upgraded: Vec::new(),
+                    });
+                }
+
+                plan.suspend_order.push(child_actor);
+                if !child_snapshot.suspended {
+                    plan.resume_targets.push(child_actor);
+                }
+                plan.upgrade_order.push(child_actor);
+            }
+        }
+
+        plan.upgrade_order.push(actor);
+        Ok(())
+    }
+
+    fn resume_upgrade_targets(
+        &mut self,
+        root: ActorId,
+        target_version: u64,
+        resume_targets: &[ActorId],
+    ) -> Result<(), LocalUpgradeError> {
+        for actor in resume_targets.iter().rev().copied() {
+            if !self.contains(actor) {
+                continue;
+            }
+
+            self.resume_actor(actor)
+                .map_err(|error| LocalUpgradeError {
+                    root,
+                    target_version,
+                    actor: Some(actor),
+                    stage: Some(LocalUpgradeStage::Resume),
+                    failure: Box::new(LocalUpgradeFailure::Send(error)),
+                    suspended: Vec::new(),
+                    upgraded: Vec::new(),
+                })?;
+        }
+        self.run_until_idle();
+        Ok(())
     }
 
     fn wait_for_control_reply<T>(

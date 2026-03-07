@@ -9,6 +9,7 @@ use std::{
 use crate::{
     actor::{Actor, ActorTurn},
     context::Context,
+    control::ControlError,
     envelope::{Envelope, ExitSignal},
     lifecycle::LifecycleEvent,
     types::{ActorId, ChildSpec, ExitReason, Shutdown, Strategy, SupervisorFlags},
@@ -51,6 +52,11 @@ pub trait Supervisor: Send + 'static {
     /// Returns the declared children in start order.
     fn child_specs(&self) -> &[ChildSpec];
 
+    /// Returns the control-plane state version for this supervisor behaviour.
+    fn state_version(&self) -> u64 {
+        0
+    }
+
     /// Starts one child from its spec and returns the running actor id.
     fn start_child<C: Context>(
         &mut self,
@@ -66,6 +72,23 @@ pub trait Supervisor: Send + 'static {
         reason: ExitReason,
         ctx: &mut C,
     ) -> SupervisorDirective;
+
+    /// Runs during a reserved code-change flow for the supervisor actor itself.
+    fn code_change<C: Context>(
+        &mut self,
+        from_version: u64,
+        to_version: u64,
+        _ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        if from_version == to_version {
+            Ok(())
+        } else {
+            Err(ControlError::VersionMismatch {
+                current: from_version,
+                requested: to_version,
+            })
+        }
+    }
 }
 
 /// Actor adapter that executes a typed supervisor on the runtime.
@@ -115,6 +138,34 @@ impl<S: Supervisor> Actor for SupervisorActor<S> {
             }
             _ => ActorTurn::Continue,
         }
+    }
+
+    fn state_version(&self) -> u64 {
+        self.supervisor.state_version()
+    }
+
+    fn code_change<C: Context>(
+        &mut self,
+        target_version: u64,
+        ctx: &mut C,
+    ) -> Result<(), ControlError> {
+        if self.state.action.is_some() {
+            return Err(ControlError::rejected(
+                "CodeChange",
+                "supervisor is processing a restart or shutdown",
+            ));
+        }
+
+        let from_version = self.supervisor.state_version();
+        self.supervisor
+            .code_change(from_version, target_version, ctx)?;
+
+        let flags = self.supervisor.flags();
+        let specs = self.supervisor.child_specs().to_vec();
+        self.state.validate_reconfigure(&specs)?;
+        self.state.reconfigure(flags, specs.clone());
+        ctx.configure_supervisor(flags, specs);
+        Ok(())
     }
 }
 
@@ -469,6 +520,12 @@ impl RestartIntensity {
     pub fn active_restarts(&mut self, now: Instant) -> usize {
         self.prune(now);
         self.restarts.len()
+    }
+
+    /// Replaces the restart flags while preserving the current sliding window.
+    pub fn reconfigure(&mut self, flags: SupervisorFlags) {
+        self.flags = flags;
+        self.prune(Instant::now());
     }
 
     fn prune(&mut self, now: Instant) {

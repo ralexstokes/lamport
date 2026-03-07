@@ -1229,8 +1229,11 @@ impl ConcurrentContext {
 
 impl SupervisorContext for ConcurrentContext {
     fn configure_supervisor(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
-        self.actor_record_mut(|actor| {
-            actor.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
+        self.actor_record_mut(|actor| match actor.supervisor.as_mut() {
+            Some(supervisor) => supervisor.reconfigure(flags, child_specs),
+            None => {
+                actor.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
+            }
         });
     }
 

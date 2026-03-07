@@ -50,4 +50,12 @@ impl SupervisorRuntimeState {
             active_restarts: self.intensity.active_restarts(Instant::now()),
         }
     }
+
+    pub(crate) fn reconfigure(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
+        self.flags = flags;
+        self.child_specs = child_specs;
+        self.running
+            .retain(|child_id, _| self.child_specs.iter().any(|spec| spec.id == *child_id));
+        self.intensity.reconfigure(flags);
+    }
 }

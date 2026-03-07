@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::{
+    context::SendError,
     envelope::{Message, Payload},
     types::ActorId,
 };
@@ -142,6 +143,98 @@ impl fmt::Display for ControlError {
             ),
             Self::Rejected { operation, reason } => {
                 write!(f, "control operation `{operation}` rejected: {reason}")
+            }
+        }
+    }
+}
+
+/// Runtime stage for a local supervisor-tree upgrade transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalUpgradeStage {
+    /// Quiescing normal user-envelope processing by suspending the tree.
+    Suspend,
+    /// Running actor-local code-change hooks in upgrade order.
+    CodeChange,
+    /// Releasing the tree back to normal user-envelope processing.
+    Resume,
+}
+
+/// Failure kind surfaced by a local supervisor-tree upgrade transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalUpgradeFailure {
+    /// The requested root is not a live supervisor.
+    NotLiveSupervisor(ActorId),
+    /// The runtime found a tree-shape invariant that makes upgrade unsafe.
+    InvalidTree {
+        /// Actor whose subtree failed validation.
+        actor: ActorId,
+        /// Human-readable rejection reason.
+        reason: String,
+    },
+    /// A reserved suspend or resume message could not be enqueued.
+    Send(SendError),
+    /// A reserved code-change operation rejected or failed.
+    Control(ControlError),
+}
+
+/// Successful local supervisor-tree upgrade details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUpgradeReport {
+    /// Root supervisor that scoped the upgrade.
+    pub root: ActorId,
+    /// Target version requested for each upgraded actor.
+    pub target_version: u64,
+    /// Root-to-leaf traversal order used when quiescing the tree.
+    pub suspend_order: Vec<ActorId>,
+    /// Leaf-to-root traversal order used for `CodeChange`.
+    pub upgrade_order: Vec<ActorId>,
+}
+
+/// Structured failure returned by a local supervisor-tree upgrade transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUpgradeError {
+    /// Root supervisor that scoped the upgrade.
+    pub root: ActorId,
+    /// Target version requested for the upgrade.
+    pub target_version: u64,
+    /// Actor whose step failed, when the failure happened after planning.
+    pub actor: Option<ActorId>,
+    /// Upgrade stage that failed, when the failure happened after planning.
+    pub stage: Option<LocalUpgradeStage>,
+    /// Concrete reason the transaction aborted.
+    pub failure: Box<LocalUpgradeFailure>,
+    /// Actors newly suspended by this transaction before it failed.
+    pub suspended: Vec<ActorId>,
+    /// Actors whose `CodeChange` hook completed before the failure.
+    pub upgraded: Vec<ActorId>,
+}
+
+impl fmt::Display for LocalUpgradeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.stage, &self.actor, self.failure.as_ref()) {
+            (Some(stage), Some(actor), LocalUpgradeFailure::Send(error)) => {
+                write!(
+                    f,
+                    "local upgrade failed during {stage:?} for actor `{actor}`: {error:?}"
+                )
+            }
+            (Some(stage), Some(actor), LocalUpgradeFailure::Control(error)) => {
+                write!(
+                    f,
+                    "local upgrade failed during {stage:?} for actor `{actor}`: {error}"
+                )
+            }
+            (_, _, LocalUpgradeFailure::NotLiveSupervisor(actor)) => {
+                write!(f, "actor `{actor}` is not a live supervisor root")
+            }
+            (_, _, LocalUpgradeFailure::InvalidTree { actor, reason }) => {
+                write!(f, "invalid supervisor tree at actor `{actor}`: {reason}")
+            }
+            (_, _, LocalUpgradeFailure::Send(error)) => {
+                write!(f, "local upgrade failed: {error:?}")
+            }
+            (_, _, LocalUpgradeFailure::Control(error)) => {
+                write!(f, "local upgrade failed: {error}")
             }
         }
     }
