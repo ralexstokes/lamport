@@ -265,8 +265,8 @@ traffic.
 - [x] Introduce actor-selected single-node receive primitives (`receive_next`, selective receive, and watermark-based reply matching).
 - [x] Add receive-timeout helpers and scheduler-yield guidance for longer selective-receive loops.
 - [x] Harden local ids/refs and introduce a future-proof local process-address type.
-- Add a real local upgrade workflow across supervisors and applications.
-- Nail down runtime-originated delivery overflow semantics and actor finalization guarantees.
+- [x] Add a real local upgrade workflow across supervisors and applications.
+- [x] Nail down runtime-originated delivery overflow semantics and actor finalization guarantees.
 
 - Add node identity and connection management.
 - Add remote send/reply/monitor/link basics.
