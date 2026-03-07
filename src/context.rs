@@ -9,7 +9,9 @@ use crate::{
     registry::RegistryError,
     scheduler::PoolKind,
     supervisor::{Supervisor, SupervisorActor},
-    types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, SupervisorFlags, TimerToken},
+    types::{
+        ActorId, ChildSpec, ExitReason, ProcessAddr, Ref, Shutdown, SupervisorFlags, TimerToken,
+    },
 };
 
 /// Options applied when spawning a new actor.
@@ -208,7 +210,7 @@ pub trait ActorContext {
     fn spawn<A: Actor>(&mut self, actor: A, options: SpawnOptions) -> Result<ActorId, SpawnError>;
 
     /// Resolves a registered actor name through the runtime registry.
-    fn whereis(&self, name: &str) -> Option<ActorId>;
+    fn whereis(&self, name: &str) -> Option<ProcessAddr>;
 
     /// Registers the current actor under a stable name.
     fn register_name(&mut self, name: String) -> Result<(), RegistryError>;
@@ -217,15 +219,19 @@ pub trait ActorContext {
     fn unregister_name(&mut self) -> Option<String>;
 
     /// Sends an envelope directly to another actor.
-    fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError>;
+    fn send_envelope<T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        envelope: Envelope,
+    ) -> Result<(), SendError>;
 
     /// Sends a typed request and captures the reply reference and mailbox watermark.
     ///
     /// When `timeout` is set, the runtime delivers `Envelope::CallTimeout` with
     /// the same reference if no reply arrives before the deadline.
-    fn ask<M: Message>(
+    fn ask<M: Message, T: Into<ProcessAddr>>(
         &mut self,
-        to: ActorId,
+        to: T,
         message: M,
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError>;
@@ -294,13 +300,13 @@ pub trait ActorContext {
         F: FnMut(&Envelope) -> bool;
 
     /// Creates a bidirectional failure relationship with another actor.
-    fn link(&mut self, other: ActorId) -> Result<(), LinkError>;
+    fn link<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError>;
 
     /// Removes a bidirectional failure relationship.
-    fn unlink(&mut self, other: ActorId) -> Result<(), LinkError>;
+    fn unlink<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError>;
 
     /// Creates a one-way monitor and returns the reference.
-    fn monitor(&mut self, other: ActorId) -> Result<Ref, MonitorError>;
+    fn monitor<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<Ref, MonitorError>;
 
     /// Removes a one-way monitor by reference.
     fn demonitor(&mut self, reference: Ref) -> Result<(), MonitorError>;
@@ -354,7 +360,11 @@ pub trait ActorContext {
     fn exit(&mut self, reason: ExitReason);
 
     /// Requests runtime-managed shutdown for another actor.
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError>;
+    fn shutdown_actor<T: Into<ProcessAddr>>(
+        &mut self,
+        actor: T,
+        policy: Shutdown,
+    ) -> Result<(), SendError>;
 }
 
 /// Higher-level actor spawn and messaging helpers layered on top of [`ActorContext`].
@@ -399,7 +409,11 @@ pub trait BehaviourContextExt: ActorContext {
     }
 
     /// Sends a typed fire-and-forget message to another actor.
-    fn send<M: Message>(&mut self, to: ActorId, message: M) -> Result<(), SendError> {
+    fn send<M: Message, T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        message: M,
+    ) -> Result<(), SendError> {
         self.send_envelope(to, Envelope::user(message))
     }
 

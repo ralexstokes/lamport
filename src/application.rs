@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(handle.name(), "empty");
         assert_eq!(
             runtime.resolve_name("empty.root"),
-            Some(handle.root_supervisor())
+            Some(handle.root_supervisor().into())
         );
 
         let snapshot = runtime

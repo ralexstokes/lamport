@@ -65,8 +65,9 @@ these semantics:
 - a restarted actor MUST receive a different actor ID from the prior instance
 - stale actor IDs MUST NOT resolve to unrelated live actors
 
-The reference implementation currently allocates only generation `0`, but the
-conceptual model includes generation for stale-handle detection.
+Actor IDs identify local actor instances. Routing-facing APIs MAY wrap them in a
+separate process-address abstraction, but that abstraction MUST preserve local
+stale-handle rejection semantics.
 
 ### 4.2 References
 
@@ -79,6 +80,9 @@ The runtime MUST provide a globally unique reference type used for:
 
 References MUST be monotonically allocated from a runtime-unique counter or an
 equivalent source of uniqueness.
+
+Timer tokens and blocking-task handles MAY wrap the same underlying reference
+type as long as their lifecycle is explicit in the public API.
 
 ### 4.3 Timer Tokens
 

@@ -32,7 +32,9 @@ stop.
 
 This model gives you:
 
-- stable `ActorId`s for live actors
+- generation-bearing `ActorId`s with stale-handle rejection on slot reuse
+- local `ProcessAddr` values for routing without baking "always local" into
+  every API
 - bounded mailboxes
 - actor-selected receive with selective receive, mailbox watermarks, and
   receive-timeout helpers
@@ -74,7 +76,8 @@ The repo also provides the pieces needed to operate and inspect a runtime:
 - retained lifecycle events and crash reports
 - incremental event consumption with `EventCursor`
 - Prometheus text export through `export_metrics_prometheus`
-- registered names via the runtime registry
+- registered names via the runtime registry, resolved as local process
+  addresses
 
 The [`examples/observability.rs`](../../examples/observability.rs) example is
 the best compact tour of these APIs.

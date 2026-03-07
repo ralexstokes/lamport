@@ -81,7 +81,7 @@ impl GenServer for FlakyWorker {
 struct MonitorProbe {
     target_name: &'static str,
     retry_token: TimerToken,
-    current_target: Option<ActorId>,
+    current_target: Option<lamport::ProcessAddr>,
     current_monitor: Option<lamport::Ref>,
 }
 

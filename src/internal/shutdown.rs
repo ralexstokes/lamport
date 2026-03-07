@@ -48,7 +48,7 @@ impl ShutdownMode {
 
 pub(crate) const fn shutdown_signal(requester: ActorId) -> ExitSignal {
     ExitSignal {
-        from: requester,
+        from: crate::types::ProcessAddr::local(requester),
         reason: ExitReason::Shutdown,
         linked: true,
     }

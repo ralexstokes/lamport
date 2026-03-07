@@ -593,7 +593,7 @@ fn service_style_workload_handles_parallel_request_reply_traffic() {
     assert!(runtime.wait_for_idle(Some(Duration::from_secs(2))));
     assert_eq!(
         runtime.resolve_name(SERVICE_ROOT),
-        Some(handle.root_supervisor())
+        Some(handle.root_supervisor().into())
     );
     assert!(runtime.resolve_name(SERVICE_NAME).is_some());
 

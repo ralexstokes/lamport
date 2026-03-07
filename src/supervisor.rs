@@ -120,8 +120,10 @@ impl<S: Supervisor> Actor for SupervisorActor<S> {
 
 impl<S: Supervisor> SupervisorActor<S> {
     fn handle_exit<C: Context>(&mut self, signal: ExitSignal, ctx: &mut C) -> ActorTurn {
-        if self.state.by_actor.contains_key(&signal.from) {
-            return self.handle_child_exit(signal.from, signal.reason, ctx);
+        if let Some(actor) = signal.from.as_local()
+            && self.state.by_actor.contains_key(&actor)
+        {
+            return self.handle_child_exit(actor, signal.reason, ctx);
         }
 
         if matches!(self.state.action, Some(SupervisorAction::Shutdown(_))) {

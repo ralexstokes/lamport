@@ -140,6 +140,7 @@ impl RuntimeShared {
             }
 
             state.completed.insert(actor, snapshot.clone());
+            state.actor_ids.release(actor);
             state.live_actors = state.live_actors.saturating_sub(1);
             (linked, monitored_by, monitoring, shutdown_tracker.is_some())
         };
@@ -180,7 +181,7 @@ impl RuntimeShared {
                 watcher,
                 Envelope::Down(DownMessage {
                     reference,
-                    actor,
+                    actor: actor.into(),
                     reason: final_reason.clone(),
                 }),
                 "down",
@@ -204,7 +205,7 @@ impl RuntimeShared {
             self.propagate_link_exit(
                 linked_actor,
                 ExitSignal {
-                    from: actor,
+                    from: actor.into(),
                     reason: linked_reason.clone(),
                     linked: true,
                 },

@@ -76,6 +76,6 @@ pub use supervisor::{
     RestartIntensity, StartChildError, Supervisor, SupervisorDirective, restart_scope,
 };
 pub use types::{
-    ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Restart,
-    Shutdown, Strategy, SupervisorFlags, TimerToken,
+    ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, ProcessAddr, Ref,
+    Restart, Shutdown, Strategy, SupervisorFlags, TimerToken,
 };

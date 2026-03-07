@@ -19,9 +19,9 @@ use crate::{
     control::{ControlError, ControlResult, StateSnapshot, TraceOptions},
     envelope::{DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted, TimerFired},
     internal::{
-        ExitDisposition, ShutdownMode, ShutdownTracker, SupervisorRuntimeState, TurnEffects,
-        actor_mailbox, classify_exit_signal, mailbox_overflow_reason, normalize_scheduler_config,
-        panic_reason, shutdown_signal,
+        ActorSlotAllocator, ExitDisposition, ShutdownMode, ShutdownTracker, SupervisorRuntimeState,
+        TurnEffects, actor_mailbox, classify_exit_signal, mailbox_overflow_reason,
+        normalize_scheduler_config, panic_reason, shutdown_signal,
     },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull, MailboxWatermark},
@@ -35,8 +35,8 @@ use crate::{
     snapshot::{ActorSnapshot, SupervisorSnapshot},
     supervisor::{Supervisor, SupervisorActor},
     types::{
-        ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, Ref, Shutdown,
-        SupervisorFlags, TimerToken,
+        ActorId, ActorIdentity, ActorMetrics, ActorStatus, ChildSpec, ExitReason, ProcessAddr, Ref,
+        Shutdown, SupervisorFlags, TimerToken,
     },
 };
 
@@ -381,7 +381,7 @@ impl<'a> LocalContext<'a> {
                 self.enqueue_self_runtime_envelope(
                     Envelope::Down(DownMessage {
                         reference,
-                        actor: other,
+                        actor: other.into(),
                         reason: ExitReason::NoProc,
                     }),
                     "down",
@@ -451,7 +451,7 @@ impl ActorContext for LocalContext<'_> {
         self.spawn_inner(actor, options)
     }
 
-    fn whereis(&self, name: &str) -> Option<ActorId> {
+    fn whereis(&self, name: &str) -> Option<ProcessAddr> {
         self.runtime.resolve_name(name)
     }
 
@@ -469,13 +469,17 @@ impl ActorContext for LocalContext<'_> {
         Some(removed)
     }
 
-    fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
-        self.send_to(to, envelope)
+    fn send_envelope<T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        envelope: Envelope,
+    ) -> Result<(), SendError> {
+        self.send_to(actor_id_from_addr(to), envelope)
     }
 
-    fn ask<M: Message>(
+    fn ask<M: Message, T: Into<ProcessAddr>>(
         &mut self,
-        to: ActorId,
+        to: T,
         message: M,
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError> {
@@ -483,7 +487,7 @@ impl ActorContext for LocalContext<'_> {
         let reply_to = ReplyToken::new(self.current.id, reference);
         let watermark = self.current.mailbox.watermark();
 
-        self.send_to(to, Envelope::request(reply_to, message))?;
+        self.send_to(actor_id_from_addr(to), Envelope::request(reply_to, message))?;
         if let Some(timeout) = timeout {
             self.runtime
                 .spawn_call_timeout(self.current.id, reference, timeout);
@@ -523,16 +527,16 @@ impl ActorContext for LocalContext<'_> {
         self.receive_selective_after_inner(Some(watermark), predicate)
     }
 
-    fn link(&mut self, other: ActorId) -> Result<(), LinkError> {
-        self.link_inner(other)
+    fn link<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError> {
+        self.link_inner(actor_id_from_addr(other))
     }
 
-    fn unlink(&mut self, other: ActorId) -> Result<(), LinkError> {
-        self.unlink_inner(other)
+    fn unlink<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError> {
+        self.unlink_inner(actor_id_from_addr(other))
     }
 
-    fn monitor(&mut self, other: ActorId) -> Result<Ref, MonitorError> {
-        Ok(self.monitor_inner(other))
+    fn monitor<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<Ref, MonitorError> {
+        Ok(self.monitor_inner(actor_id_from_addr(other)))
     }
 
     fn demonitor(&mut self, reference: Ref) -> Result<(), MonitorError> {
@@ -577,7 +581,12 @@ impl ActorContext for LocalContext<'_> {
         self.effects.exit_reason = Some(reason);
     }
 
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
+    fn shutdown_actor<T: Into<ProcessAddr>>(
+        &mut self,
+        actor: T,
+        policy: Shutdown,
+    ) -> Result<(), SendError> {
+        let actor = actor_id_from_addr(actor);
         let linked = self.current.links.contains(&actor);
         let reason = ExitReason::Shutdown;
         let result = self
@@ -587,7 +596,7 @@ impl ActorContext for LocalContext<'_> {
         if result.is_ok() && linked && !self.runtime.contains(actor) {
             self.current.links.remove(&actor);
             self.handle_current_exit_signal(ExitSignal {
-                from: actor,
+                from: actor.into(),
                 reason,
                 linked: true,
             });
@@ -660,7 +669,7 @@ pub struct LocalRuntime {
     tokio: TokioRuntime,
     event_tx: mpsc::Sender<DriverEvent>,
     event_rx: mpsc::Receiver<DriverEvent>,
-    next_local_id: u64,
+    actor_ids: ActorSlotAllocator,
     live_actors: usize,
     actors: HashMap<u64, ActorEntry>,
     completed: HashMap<ActorId, ActorSnapshot>,
@@ -709,7 +718,7 @@ impl LocalRuntime {
             tokio,
             event_tx,
             event_rx,
-            next_local_id: 0,
+            actor_ids: ActorSlotAllocator::default(),
             live_actors: 0,
             actors: HashMap::new(),
             completed: HashMap::new(),
@@ -829,27 +838,39 @@ impl LocalRuntime {
     }
 
     /// Sends a typed message from outside the runtime.
-    pub fn send<M: Message>(&mut self, to: ActorId, message: M) -> Result<(), SendError> {
+    pub fn send<M: Message, T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        message: M,
+    ) -> Result<(), SendError> {
         self.send_envelope(to, Envelope::user(message))
     }
 
     /// Sends a raw envelope from outside the runtime.
-    pub fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
-        self.enqueue_actor_envelope(to, envelope)
+    pub fn send_envelope<T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        envelope: Envelope,
+    ) -> Result<(), SendError> {
+        self.enqueue_actor_envelope(actor_id_from_addr(to), envelope)
     }
 
     /// Sends a reserved runtime control message from outside the runtime.
-    pub fn send_system(
+    pub fn send_system<T: Into<ProcessAddr>>(
         &mut self,
-        to: ActorId,
+        to: T,
         message: crate::envelope::SystemMessage,
     ) -> Result<(), SendError> {
         self.send_envelope(to, Envelope::System(message))
     }
 
     /// Requests runtime-managed shutdown using the same path as supervisors.
-    pub fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
-        self.request_shutdown(SYSTEM_ACTOR_ID, actor, policy)
+    pub fn shutdown_actor<T: Into<ProcessAddr>>(
+        &mut self,
+        actor: T,
+        policy: Shutdown,
+    ) -> Result<(), SendError> {
+        self.request_shutdown(SYSTEM_ACTOR_ID, actor_id_from_addr(actor), policy)
     }
 
     /// Retrieves a type-erased actor state snapshot through the reserved control lane.
@@ -1049,8 +1070,8 @@ impl LocalRuntime {
     }
 
     /// Looks up a registered actor by name.
-    pub fn resolve_name(&self, name: &str) -> Option<ActorId> {
-        self.registry.resolve(name)
+    pub fn resolve_name(&self, name: &str) -> Option<ProcessAddr> {
+        self.registry.resolve(name).map(ProcessAddr::from)
     }
 
     /// Registers a live actor under the provided name.
@@ -1178,9 +1199,7 @@ impl LocalRuntime {
     }
 
     fn allocate_id(&mut self) -> ActorId {
-        let id = ActorId::new(self.next_local_id, 0);
-        self.next_local_id += 1;
-        id
+        self.actor_ids.allocate()
     }
 
     fn enqueue_actor_envelope(
@@ -1601,6 +1620,12 @@ impl LocalRuntime {
 fn schedule_actor(run_queue: &mut VecDeque<ActorId>, state: &mut ActorState) {
     if let Some(actor_id) = mark_scheduled(state) {
         run_queue.push_back(actor_id);
+    }
+}
+
+fn actor_id_from_addr<T: Into<ProcessAddr>>(addr: T) -> ActorId {
+    match addr.into() {
+        ProcessAddr::Local(actor) => actor,
     }
 }
 
@@ -2265,7 +2290,7 @@ mod tests {
     }
 
     struct SelfRegisteringActor {
-        seen: Arc<Mutex<Option<crate::ActorId>>>,
+        seen: Arc<Mutex<Option<crate::ProcessAddr>>>,
         removed: Arc<Mutex<Option<String>>>,
     }
 
@@ -2614,7 +2639,7 @@ mod tests {
             .send_envelope(
                 actor,
                 Envelope::Exit(ExitSignal {
-                    from: actor,
+                    from: actor.into(),
                     reason: ExitReason::Shutdown,
                     linked: true,
                 }),
@@ -2648,7 +2673,7 @@ mod tests {
                 actor,
                 Envelope::Down(DownMessage {
                     reference: Ref::new(99),
-                    actor: crate::ActorId::new(77, 0),
+                    actor: crate::ActorId::new(77, 0).into(),
                     reason: ExitReason::Shutdown,
                 }),
             )
@@ -2695,6 +2720,20 @@ mod tests {
 
         runtime.spawn(SinkActor).unwrap();
         assert_eq!(runtime.spawn(SinkActor), Err(SpawnError::CapacityExceeded));
+    }
+
+    #[test]
+    fn respawn_reuses_slot_with_incremented_generation_and_rejects_stale_id() {
+        let mut runtime = LocalRuntime::default();
+        let first = runtime.spawn(SinkActor).unwrap();
+
+        assert!(runtime.exit_actor(first, ExitReason::Normal));
+
+        let second = runtime.spawn(SinkActor).unwrap();
+        assert_eq!(second.local_id, first.local_id);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(runtime.send(first, 1_u32), Err(SendError::NoProc(first)));
+        assert!(runtime.contains(second));
     }
 
     #[test]
@@ -2748,7 +2787,7 @@ mod tests {
         let second = runtime.spawn(SinkActor).unwrap();
 
         runtime.register_name(first, "worker".into()).unwrap();
-        assert_eq!(runtime.resolve_name("worker"), Some(first));
+        assert_eq!(runtime.resolve_name("worker"), Some(first.into()));
         assert_eq!(
             runtime.register_name(second, "worker".into()),
             Err(RegistryError::NameTaken {
@@ -2774,7 +2813,7 @@ mod tests {
 
         runtime.run_until_idle();
 
-        assert_eq!(*seen.lock().unwrap(), Some(actor));
+        assert_eq!(*seen.lock().unwrap(), Some(actor.into()));
         assert_eq!(removed.lock().unwrap().as_deref(), Some("self-worker"));
         assert_eq!(runtime.resolve_name("self-worker"), None);
     }

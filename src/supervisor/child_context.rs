@@ -11,7 +11,9 @@ use crate::{
     lifecycle::LifecycleEvent,
     mailbox::MailboxWatermark,
     registry::RegistryError,
-    types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, SupervisorFlags, TimerToken},
+    types::{
+        ActorId, ChildSpec, ExitReason, ProcessAddr, Ref, Shutdown, SupervisorFlags, TimerToken,
+    },
 };
 
 pub(super) struct SupervisorChildContext<'a, C> {
@@ -51,7 +53,7 @@ impl<C: Context> ActorContext for SupervisorChildContext<'_, C> {
         Ok(actor_id)
     }
 
-    fn whereis(&self, name: &str) -> Option<ActorId> {
+    fn whereis(&self, name: &str) -> Option<ProcessAddr> {
         self.inner.whereis(name)
     }
 
@@ -63,13 +65,17 @@ impl<C: Context> ActorContext for SupervisorChildContext<'_, C> {
         self.inner.unregister_name()
     }
 
-    fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
+    fn send_envelope<T: Into<ProcessAddr>>(
+        &mut self,
+        to: T,
+        envelope: Envelope,
+    ) -> Result<(), SendError> {
         self.inner.send_envelope(to, envelope)
     }
 
-    fn ask<M: Message>(
+    fn ask<M: Message, T: Into<ProcessAddr>>(
         &mut self,
-        to: ActorId,
+        to: T,
         message: M,
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError> {
@@ -102,15 +108,15 @@ impl<C: Context> ActorContext for SupervisorChildContext<'_, C> {
         self.inner.receive_selective_after(watermark, predicate)
     }
 
-    fn link(&mut self, other: ActorId) -> Result<(), LinkError> {
+    fn link<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError> {
         self.inner.link(other)
     }
 
-    fn unlink(&mut self, other: ActorId) -> Result<(), LinkError> {
+    fn unlink<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<(), LinkError> {
         self.inner.unlink(other)
     }
 
-    fn monitor(&mut self, other: ActorId) -> Result<Ref, MonitorError> {
+    fn monitor<T: Into<ProcessAddr>>(&mut self, other: T) -> Result<Ref, MonitorError> {
         self.inner.monitor(other)
     }
 
@@ -154,7 +160,11 @@ impl<C: Context> ActorContext for SupervisorChildContext<'_, C> {
         self.inner.exit(reason);
     }
 
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
+    fn shutdown_actor<T: Into<ProcessAddr>>(
+        &mut self,
+        actor: T,
+        policy: Shutdown,
+    ) -> Result<(), SendError> {
         self.inner.shutdown_actor(actor, policy)
     }
 }

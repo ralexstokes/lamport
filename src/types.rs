@@ -3,7 +3,7 @@ mod exit;
 mod status;
 mod supervision;
 
-pub use actor::{ActorId, Ref, TimerToken};
+pub use actor::{ActorId, ProcessAddr, Ref, TimerToken};
 pub use exit::{ActorIdentity, ExitReason};
 pub use status::{ActorMetrics, ActorStatus};
 pub use supervision::{ChildSpec, Restart, Shutdown, Strategy, SupervisorFlags};

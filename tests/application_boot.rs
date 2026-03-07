@@ -239,8 +239,11 @@ fn booted_application_manages_and_restarts_a_public_supervised_subtree() {
     let root = handle.root_supervisor();
     let worker_before = child_actor(&mut runtime, root);
     assert_eq!(handle.name(), "integration-app");
-    assert_eq!(runtime.resolve_name(ROOT_NAME), Some(root));
-    assert_eq!(runtime.resolve_name(WORKER_NAME), Some(worker_before));
+    assert_eq!(runtime.resolve_name(ROOT_NAME), Some(root.into()));
+    assert_eq!(
+        runtime.resolve_name(WORKER_NAME),
+        Some(worker_before.into())
+    );
     assert_eq!(request_generation(&mut runtime, worker_before), 1);
     assert_eq!(starts.load(Ordering::SeqCst), 1);
 
@@ -251,7 +254,7 @@ fn booted_application_manages_and_restarts_a_public_supervised_subtree() {
 
     let worker_after = child_actor(&mut runtime, root);
     assert_ne!(worker_before, worker_after);
-    assert_eq!(runtime.resolve_name(WORKER_NAME), Some(worker_after));
+    assert_eq!(runtime.resolve_name(WORKER_NAME), Some(worker_after.into()));
     assert_eq!(starts.load(Ordering::SeqCst), 2);
     assert_eq!(request_generation(&mut runtime, worker_after), 2);
 

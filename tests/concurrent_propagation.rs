@@ -7,7 +7,7 @@ mod support;
 
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, ConcurrentRuntime, Context, DownMessage, Envelope,
-    ExitReason, SchedulerConfig, SpawnOptions,
+    ExitReason, ProcessAddr, SchedulerConfig, SpawnOptions,
 };
 use support::wait_until_concurrent;
 
@@ -49,7 +49,7 @@ impl Actor for LinkedActor {
 
 struct TrappingLinkActor {
     target: ActorId,
-    seen: Arc<Mutex<Vec<(ActorId, ActorId, ExitReason)>>>,
+    seen: Arc<Mutex<Vec<(ActorId, ProcessAddr, ExitReason)>>>,
 }
 
 impl Actor for TrappingLinkActor {
@@ -73,7 +73,7 @@ impl Actor for TrappingLinkActor {
 
 struct MonitoringActor {
     target: ActorId,
-    seen: Arc<Mutex<Vec<(ActorId, ActorId, ExitReason)>>>,
+    seen: Arc<Mutex<Vec<(ActorId, ProcessAddr, ExitReason)>>>,
 }
 
 impl Actor for MonitoringActor {

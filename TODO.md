@@ -219,7 +219,7 @@ traffic.
 - [x] Finish the remaining single-node control-plane features (`GetState`, `ReplaceState`, tracing control, code change, and unified external shutdown entrypoints).
 - [x] Introduce actor-selected single-node receive primitives (`receive_next`, selective receive, and watermark-based reply matching).
 - [x] Add receive-timeout helpers and scheduler-yield guidance for longer selective-receive loops.
-- Harden local ids/refs and introduce a future-proof local process-address type.
+- [x] Harden local ids/refs and introduce a future-proof local process-address type.
 
 - Add node identity and connection management.
 - Add remote send/reply/monitor/link basics.

@@ -7,7 +7,7 @@ use std::{
 use crate::{
     control::{ControlResult, StateSnapshot, TraceOptions},
     scheduler::PoolKind,
-    types::{ActorId, ExitReason, Ref, TimerToken},
+    types::{ExitReason, ProcessAddr, Ref, TimerToken},
 };
 
 /// Soft limit for inline payloads stored directly in mailboxes.
@@ -76,15 +76,18 @@ impl fmt::Debug for Payload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReplyToken {
     /// The actor waiting for the response.
-    pub from: ActorId,
+    pub from: ProcessAddr,
     /// The unique request reference.
     pub reference: Ref,
 }
 
 impl ReplyToken {
     /// Creates a reply token for the actor and request reference.
-    pub const fn new(from: ActorId, reference: Ref) -> Self {
-        Self { from, reference }
+    pub fn new<A: Into<ProcessAddr>>(from: A, reference: Ref) -> Self {
+        Self {
+            from: from.into(),
+            reference,
+        }
     }
 }
 
@@ -92,7 +95,7 @@ impl ReplyToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitSignal {
     /// The actor that exited.
-    pub from: ActorId,
+    pub from: ProcessAddr,
     /// The reason for the exit.
     pub reason: ExitReason,
     /// Whether the exit came from a bidirectional link.
@@ -105,7 +108,7 @@ pub struct DownMessage {
     /// The monitor reference returned by `monitor`.
     pub reference: Ref,
     /// The actor that terminated.
-    pub actor: ActorId,
+    pub actor: ProcessAddr,
     /// The exit reason for the terminated actor.
     pub reason: ExitReason,
 }

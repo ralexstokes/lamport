@@ -36,6 +36,57 @@ impl fmt::Display for ActorId {
     }
 }
 
+/// A routable process address.
+///
+/// This is intentionally distinct from [`ActorId`]: today every address is
+/// local, but the enum shape avoids hard-coding that assumption into the
+/// routing-facing API surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProcessAddr {
+    /// A process running inside the current runtime instance.
+    Local(ActorId),
+}
+
+impl ProcessAddr {
+    /// Creates a local process address from an actor id.
+    pub const fn local(actor: ActorId) -> Self {
+        Self::Local(actor)
+    }
+
+    /// Returns the local actor id when the address points at a local process.
+    pub const fn as_local(self) -> Option<ActorId> {
+        match self {
+            Self::Local(actor) => Some(actor),
+        }
+    }
+}
+
+impl From<ActorId> for ProcessAddr {
+    fn from(value: ActorId) -> Self {
+        Self::Local(value)
+    }
+}
+
+impl PartialEq<ActorId> for ProcessAddr {
+    fn eq(&self, other: &ActorId) -> bool {
+        matches!(self, Self::Local(actor) if actor == other)
+    }
+}
+
+impl PartialEq<ProcessAddr> for ActorId {
+    fn eq(&self, other: &ProcessAddr) -> bool {
+        other == self
+    }
+}
+
+impl fmt::Display for ProcessAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(actor) => actor.fmt(f),
+        }
+    }
+}
+
 /// A runtime-unique reference for monitors, calls, and timers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ref(u64);

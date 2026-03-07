@@ -49,10 +49,13 @@ fn run() -> Result<(), String> {
     let coordinator = runtime
         .resolve_name(COORDINATOR_NAME)
         .ok_or_else(|| "coordinator did not register".to_owned())?;
-    wait_until_concurrent_actor_dead(&runtime, coordinator, COORDINATOR_DEADLINE)?;
+    let coordinator_actor = coordinator
+        .as_local()
+        .ok_or_else(|| "coordinator resolved to a non-local address".to_owned())?;
+    wait_until_concurrent_actor_dead(&runtime, coordinator_actor, COORDINATOR_DEADLINE)?;
 
     let coordinator_exit = runtime
-        .actor_snapshot(coordinator)
+        .actor_snapshot(coordinator_actor)
         .and_then(|snapshot| snapshot.metrics.last_exit)
         .ok_or_else(|| "coordinator exit reason was not retained".to_owned())?;
 

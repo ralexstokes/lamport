@@ -183,6 +183,7 @@ impl LocalRuntime {
 
         let id = entry.state.id;
         self.completed.insert(id, entry.snapshot());
+        self.actor_ids.release(id);
         self.live_actors = self.live_actors.saturating_sub(1);
     }
 
@@ -219,7 +220,7 @@ impl LocalRuntime {
                     watcher_state,
                     Envelope::Down(DownMessage {
                         reference,
-                        actor,
+                        actor: actor.into(),
                         reason: reason.clone(),
                     }),
                 )
@@ -263,7 +264,7 @@ impl LocalRuntime {
             self.propagate_link_exit(
                 linked_actor,
                 ExitSignal {
-                    from: actor,
+                    from: actor.into(),
                     reason: reason.clone(),
                     linked: true,
                 },
