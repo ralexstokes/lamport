@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
+  ci:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
