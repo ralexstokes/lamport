@@ -508,7 +508,7 @@ impl CoordinatorServer {
     }
 
     fn next_player(&self, state: &CoordinatorState) -> ProviderKind {
-        if state.turns.len() % 2 == 0 {
+        if state.turns.len().is_multiple_of(2) {
             self.x_player
         } else {
             self.x_player.opponent()

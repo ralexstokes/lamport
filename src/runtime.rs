@@ -361,10 +361,10 @@ impl<'a> LocalContext<'a> {
             self.current.links.insert(id);
         }
 
-        if let Some(child_id) = options.supervisor_child {
-            if let Some(supervisor) = self.current.supervisor.as_mut() {
-                supervisor.set_running(child_id, id);
-            }
+        if let Some(child_id) = options.supervisor_child
+            && let Some(supervisor) = self.current.supervisor.as_mut()
+        {
+            supervisor.set_running(child_id, id);
         }
         Ok(id)
     }
@@ -1107,12 +1107,11 @@ impl LocalRuntime {
         self.actors.insert(entry.state.id.local_id, entry);
         self.live_actors += 1;
 
-        if let (Some(parent), Some(child_id)) = (parent, supervisor_child) {
-            if let Some(parent_state) = self.actor_state_mut(parent) {
-                if let Some(supervisor) = parent_state.supervisor.as_mut() {
-                    supervisor.set_running(child_id, actor_id);
-                }
-            }
+        if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
+            && let Some(parent_state) = self.actor_state_mut(parent)
+            && let Some(supervisor) = parent_state.supervisor.as_mut()
+        {
+            supervisor.set_running(child_id, actor_id);
         }
 
         self.record_lifecycle_event(LifecycleEvent::Spawn {
@@ -1211,10 +1210,10 @@ impl LocalRuntime {
     }
 
     fn cancel_shutdown(&mut self, actor: ActorId) {
-        if let Some(mut tracker) = self.shutdown_tasks.remove(&actor) {
-            if let Some(task) = tracker.task.take() {
-                task.abort();
-            }
+        if let Some(mut tracker) = self.shutdown_tasks.remove(&actor)
+            && let Some(task) = tracker.task.take()
+        {
+            task.abort();
         }
     }
 
@@ -1256,7 +1255,7 @@ impl LocalRuntime {
 
         match turn_result {
             Ok(turn) => {
-                let exit_reason = effects.exit_reason.or_else(|| match turn {
+                let exit_reason = effects.exit_reason.or(match turn {
                     ActorTurn::Stop(reason) => Some(reason),
                     ActorTurn::Continue | ActorTurn::Yield => None,
                 });
@@ -1391,12 +1390,11 @@ impl LocalRuntime {
             final_reason.clone()
         };
 
-        if let (Some(parent), Some(child_id)) = (parent, supervisor_child) {
-            if let Some(parent_state) = self.actor_state_mut(parent) {
-                if let Some(supervisor) = parent_state.supervisor.as_mut() {
-                    supervisor.clear_running(child_id, actor_id);
-                }
-            }
+        if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
+            && let Some(parent_state) = self.actor_state_mut(parent)
+            && let Some(supervisor) = parent_state.supervisor.as_mut()
+        {
+            supervisor.clear_running(child_id, actor_id);
         }
 
         self.remove_outgoing_monitors(actor_id, monitoring);
@@ -2011,13 +2009,12 @@ mod tests {
         }
 
         fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
-            if let Envelope::CallTimeout(timeout) = envelope {
-                if self
+            if let Envelope::CallTimeout(timeout) = envelope
+                && self
                     .pending
                     .is_some_and(|pending| pending.matches(timeout.reference))
-                {
-                    self.seen.lock().unwrap().push(timeout.reference);
-                }
+            {
+                self.seen.lock().unwrap().push(timeout.reference);
             }
 
             ActorTurn::Continue

@@ -154,7 +154,6 @@ impl DemoSupervisor {
                 strategy: Strategy::OneForOne,
                 intensity: RESTART_INTENSITY,
                 period: RESTART_PERIOD,
-                ..SupervisorFlags::default()
             },
             specs: vec![ChildSpec {
                 id: WORKER_CHILD,

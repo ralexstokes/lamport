@@ -289,36 +289,32 @@ impl RuntimeShared {
         state.actors.insert(actor.id.local_id, actor);
         state.live_actors += 1;
 
-        if link_to_parent {
-            if let Some(parent_id) = parent {
-                if let Some(parent_state) = state
-                    .actors
-                    .get_mut(&parent_id.local_id)
-                    .and_then(|entry| (entry.id == parent_id).then_some(entry))
-                {
-                    parent_state.links.insert(actor_id);
-                }
+        if link_to_parent && let Some(parent_id) = parent {
+            if let Some(parent_state) = state
+                .actors
+                .get_mut(&parent_id.local_id)
+                .and_then(|entry| (entry.id == parent_id).then_some(entry))
+            {
+                parent_state.links.insert(actor_id);
+            }
 
-                if let Some(child_state) = state
-                    .actors
-                    .get_mut(&actor_id.local_id)
-                    .and_then(|entry| (entry.id == actor_id).then_some(entry))
-                {
-                    child_state.links.insert(parent_id);
-                }
+            if let Some(child_state) = state
+                .actors
+                .get_mut(&actor_id.local_id)
+                .and_then(|entry| (entry.id == actor_id).then_some(entry))
+            {
+                child_state.links.insert(parent_id);
             }
         }
 
-        if let (Some(parent), Some(child_id)) = (parent, supervisor_child) {
-            if let Some(parent_state) = state
+        if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
+            && let Some(parent_state) = state
                 .actors
                 .get_mut(&parent.local_id)
                 .and_then(|entry| (entry.id == parent).then_some(entry))
-            {
-                if let Some(supervisor) = parent_state.supervisor.as_mut() {
-                    supervisor.set_running(child_id, actor_id);
-                }
-            }
+            && let Some(supervisor) = parent_state.supervisor.as_mut()
+        {
+            supervisor.set_running(child_id, actor_id);
         }
 
         Self::record_lifecycle_event(
@@ -598,10 +594,10 @@ impl RuntimeShared {
 
     fn register_name(&self, actor: ActorId, name: String) -> Result<(), RegistryError> {
         let mut state = self.lock_state();
-        if !state
+        if state
             .actors
             .get(&actor.local_id)
-            .is_some_and(|entry| entry.id == actor)
+            .is_none_or(|entry| entry.id != actor)
         {
             return Err(RegistryError::NoProc(actor));
         }
@@ -1137,10 +1133,10 @@ impl Context for ConcurrentContext<'_> {
                 .expect("target actor must exist")
                 .shutdown
                 .take();
-            if let Some(mut tracker) = prior {
-                if let Some(task) = tracker.task.take() {
-                    task.abort();
-                }
+            if let Some(mut tracker) = prior
+                && let Some(task) = tracker.task.take()
+            {
+                task.abort();
             }
 
             RuntimeShared::record_lifecycle_event(
@@ -1262,16 +1258,14 @@ impl RuntimeShared {
                 .map(|(reference, target)| (*reference, *target))
                 .collect();
 
-            if let (Some(parent), Some(child_id)) = (parent, supervisor_child) {
-                if let Some(parent_state) = state
+            if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
+                && let Some(parent_state) = state
                     .actors
                     .get_mut(&parent.local_id)
                     .and_then(|record| (record.id == parent).then_some(record))
-                {
-                    if let Some(supervisor) = parent_state.supervisor.as_mut() {
-                        supervisor.clear_running(child_id, actor);
-                    }
-                }
+                && let Some(supervisor) = parent_state.supervisor.as_mut()
+            {
+                supervisor.clear_running(child_id, actor);
             }
 
             let mut shutdown_tracker = entry.shutdown.take();
@@ -1507,7 +1501,7 @@ async fn run_actor_task(
                 };
 
                 let exit_reason = match turn_result {
-                    Ok(turn) => effects.exit_reason.or_else(|| match turn {
+                    Ok(turn) => effects.exit_reason.or(match turn {
                         ActorTurn::Stop(reason) => Some(reason),
                         ActorTurn::Continue | ActorTurn::Yield => None,
                     }),
@@ -1663,10 +1657,10 @@ fn push_envelope(state: &mut ActorRecord, envelope: Envelope) -> Result<(), Send
     let MailboxFull { capacity } = match state.mailbox.try_push(envelope) {
         Ok(()) => {
             state.metrics.mailbox_len = state.mailbox.len();
-            if !matches!(state.status, ActorStatus::Dead | ActorStatus::Exiting) {
-                if matches!(state.status, ActorStatus::Waiting) {
-                    state.status = ActorStatus::Runnable;
-                }
+            if !matches!(state.status, ActorStatus::Dead | ActorStatus::Exiting)
+                && matches!(state.status, ActorStatus::Waiting)
+            {
+                state.status = ActorStatus::Runnable;
             }
             return Ok(());
         }
@@ -2101,11 +2095,10 @@ impl Scheduler for ConcurrentRuntime {
             .actors
             .get_mut(&actor.local_id)
             .and_then(|record| (record.id == actor).then_some(record))
+            && entry.mailbox.is_empty()
         {
-            if entry.mailbox.is_empty() {
-                entry.status = ActorStatus::Waiting;
-                entry.metrics.scheduler_id = None;
-            }
+            entry.status = ActorStatus::Waiting;
+            entry.metrics.scheduler_id = None;
         }
         self.inner.idle_cv.notify_all();
     }
@@ -2258,13 +2251,12 @@ mod tests {
         }
 
         fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
-            if let Envelope::CallTimeout(timeout) = envelope {
-                if self
+            if let Envelope::CallTimeout(timeout) = envelope
+                && self
                     .pending
                     .is_some_and(|pending| pending.matches(timeout.reference))
-                {
-                    self.seen.lock().unwrap().push(timeout.reference);
-                }
+            {
+                self.seen.lock().unwrap().push(timeout.reference);
             }
 
             ActorTurn::Continue

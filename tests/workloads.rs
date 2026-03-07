@@ -183,10 +183,10 @@ impl Actor for ChatClient {
         match envelope {
             Envelope::Reply { message, .. } => {
                 let reply = message.downcast::<ChatReply>().ok().unwrap();
-                if let ChatReply::Joined = reply {
-                    if let Err(reason) = self.schedule_speak(ctx) {
-                        return ActorTurn::Stop(reason);
-                    }
+                if let ChatReply::Joined = reply
+                    && let Err(reason) = self.schedule_speak(ctx)
+                {
+                    return ActorTurn::Stop(reason);
                 }
             }
             Envelope::User(payload) => {
@@ -199,18 +199,18 @@ impl Actor for ChatClient {
                 self.log.lock().unwrap().push(line);
             }
             Envelope::Timer(timer) if timer.token == self.speak_token => {
-                if let Some(line) = self.script.pop_front() {
-                    if let Err(error) = ctx.send(
+                if let Some(line) = self.script.pop_front()
+                    && let Err(error) = ctx.send(
                         self.room,
                         CastMessage(ChatCast::Say {
                             from: self.name.clone(),
                             text: line,
                         }),
-                    ) {
-                        return ActorTurn::Stop(ExitReason::Error(format!(
-                            "chat send failed: {error:?}"
-                        )));
-                    }
+                    )
+                {
+                    return ActorTurn::Stop(ExitReason::Error(format!(
+                        "chat send failed: {error:?}"
+                    )));
                 }
 
                 let scheduled = if self.script.is_empty() {

@@ -227,18 +227,18 @@ impl Actor for ChatClient {
                 }
             }
             Envelope::Timer(timer) if timer.token == self.speak_token => {
-                if let Some(line) = self.script.pop_front() {
-                    if let Err(error) = ctx.send(
+                if let Some(line) = self.script.pop_front()
+                    && let Err(error) = ctx.send(
                         self.room,
                         CastMessage(ChatCast::Say {
                             from: self.name.clone(),
                             text: line,
                         }),
-                    ) {
-                        return ActorTurn::Stop(ExitReason::Error(format!(
-                            "send message failed: {error:?}"
-                        )));
-                    }
+                    )
+                {
+                    return ActorTurn::Stop(ExitReason::Error(format!(
+                        "send message failed: {error:?}"
+                    )));
                 }
 
                 let schedule_result = if self.script.is_empty() {
