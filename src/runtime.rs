@@ -18,8 +18,9 @@ use crate::{
     },
     envelope::{DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted, TimerFired},
     internal::{
-        ExitDisposition, ShutdownTracker, SupervisorRuntimeState, TurnEffects,
-        classify_exit_signal, mailbox_overflow_reason, normalize_scheduler_config, panic_reason,
+        ExitDisposition, ShutdownMode, ShutdownTracker, SupervisorRuntimeState, TurnEffects,
+        actor_mailbox, classify_exit_signal, mailbox_overflow_reason, normalize_scheduler_config,
+        panic_reason, shutdown_signal,
     },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull},
@@ -78,19 +79,9 @@ struct ActorState {
 
 impl ActorState {
     fn new(id: ActorId, options: SpawnOptions, config: &SchedulerConfig) -> Self {
-        let mailbox_capacity = options
-            .mailbox_capacity
-            .unwrap_or(config.default_mailbox_capacity);
-        let mailbox = Mailbox::with_limits(
-            mailbox_capacity,
-            config
-                .mailbox_runtime_reserve
-                .min(mailbox_capacity.saturating_sub(1)),
-        );
-
         Self {
             id,
-            mailbox,
+            mailbox: actor_mailbox(config, options.mailbox_capacity),
             links: BTreeSet::new(),
             monitors_in: BTreeMap::new(),
             monitors_out: BTreeMap::new(),
@@ -791,13 +782,13 @@ impl LocalRuntime {
     }
 
     /// Returns the accumulated runtime lifecycle events.
-    pub fn lifecycle_events(&self) -> &[LifecycleEvent] {
-        &self.lifecycle_events
+    pub fn lifecycle_events(&self) -> Vec<LifecycleEvent> {
+        self.lifecycle_events.clone()
     }
 
     /// Returns the accumulated abnormal crash reports.
-    pub fn crash_reports(&self) -> &[CrashReport] {
-        &self.crash_reports
+    pub fn crash_reports(&self) -> Vec<CrashReport> {
+        self.crash_reports.clone()
     }
 
     /// Returns retained structured runtime events for tracing and debugging.
@@ -1067,23 +1058,19 @@ impl LocalRuntime {
             reason: None,
         });
 
-        match policy.clone() {
-            Shutdown::BrutalKill => {
-                self.shutdown_tasks.insert(
-                    actor,
-                    ShutdownTracker {
-                        requester,
-                        policy,
-                        task: None,
-                    },
-                );
+        match ShutdownMode::from_policy(&policy) {
+            ShutdownMode::ForceKill => {
+                self.shutdown_tasks
+                    .insert(actor, ShutdownTracker::new(requester, policy, None));
                 self.force_exit(actor, ExitReason::Kill);
             }
-            Shutdown::Timeout(delay) => {
+            ShutdownMode::Linked {
+                timeout: Some(delay),
+            } => {
                 let task = self.spawn_shutdown_timer(actor, delay);
                 self.begin_linked_shutdown(requester, actor, policy, Some(task));
             }
-            Shutdown::Infinity => {
+            ShutdownMode::Linked { timeout: None } => {
                 self.begin_linked_shutdown(requester, actor, policy, None);
             }
         }
@@ -1098,22 +1085,9 @@ impl LocalRuntime {
         policy: Shutdown,
         task: Option<JoinHandle<()>>,
     ) {
-        self.shutdown_tasks.insert(
-            actor,
-            ShutdownTracker {
-                requester,
-                policy,
-                task,
-            },
-        );
-        self.propagate_link_exit(
-            actor,
-            ExitSignal {
-                from: requester,
-                reason: ExitReason::Shutdown,
-                linked: true,
-            },
-        );
+        self.shutdown_tasks
+            .insert(actor, ShutdownTracker::new(requester, policy, task));
+        self.propagate_link_exit(actor, shutdown_signal(requester));
     }
 
     fn cancel_shutdown(&mut self, actor: ActorId) {
@@ -2000,8 +1974,8 @@ mod tests {
             |event| matches!(&event.kind, RuntimeEventKind::Crash(report) if report.actor == child)
         ));
 
-        let crash = runtime
-            .crash_reports()
+        let crash_reports = runtime.crash_reports();
+        let crash = crash_reports
             .iter()
             .find(|report| report.actor == child)
             .unwrap();

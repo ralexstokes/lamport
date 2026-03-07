@@ -60,3 +60,25 @@ pub(super) fn downcast_user_message<C: Message, I: Message>(
         },
     }
 }
+
+pub(super) fn initialized_state<'a, T>(
+    state: &'a mut Option<T>,
+    label: &str,
+) -> Result<&'a mut T, ActorTurn> {
+    state.as_mut().ok_or_else(|| {
+        ActorTurn::Stop(ExitReason::Error(format!(
+            "{label} must be initialized before handling messages"
+        )))
+    })
+}
+
+pub(super) fn initialized_pair<'a, S, D>(
+    state: &'a mut Option<S>,
+    data: &'a mut Option<D>,
+    state_label: &str,
+    data_label: &str,
+) -> Result<(&'a mut S, &'a mut D), ActorTurn> {
+    let state = initialized_state(state, state_label)?;
+    let data = initialized_state(data, data_label)?;
+    Ok((state, data))
+}

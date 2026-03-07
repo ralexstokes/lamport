@@ -106,9 +106,12 @@ impl GenStatem for TrafficLight {
         match message {
             RuntimeInfo::Timer(timer) if timer.token == data.timer => {
                 data.cycles += 1;
-                ctx.schedule_after(data.interval, data.timer)
-                    .expect("reschedule tick");
-                StatemOutcome::Transition(next_light(state))
+                match ctx.schedule_after(data.interval, data.timer) {
+                    Ok(()) => StatemOutcome::Transition(next_light(state)),
+                    Err(error) => StatemOutcome::Stop(ExitReason::Error(format!(
+                        "reschedule tick failed: {error:?}"
+                    ))),
+                }
             }
             RuntimeInfo::Timer(_) => StatemOutcome::Continue,
             _ => StatemOutcome::Continue,
@@ -173,18 +176,26 @@ impl Actor for Inspector {
                     return ActorTurn::Stop(ExitReason::Normal);
                 }
 
-                if self.polls_left == 2 {
-                    ctx.send(
+                if self.polls_left == 2
+                    && let Err(error) = ctx.send(
                         self.light,
                         CastMessage(LightCast::Force(LightState::Yellow)),
                     )
-                    .expect("send force transition");
+                {
+                    return ActorTurn::Stop(ExitReason::Error(format!(
+                        "send force transition failed: {error:?}"
+                    )));
                 }
 
-                ctx.ask(self.light, LightCall::Snapshot, None)
-                    .expect("ask light");
+                if let Err(error) = ctx.ask(self.light, LightCall::Snapshot, None) {
+                    return ActorTurn::Stop(ExitReason::Error(format!(
+                        "ask light failed: {error:?}"
+                    )));
+                }
                 self.polls_left -= 1;
-                self.schedule_next(ctx).expect("schedule next query");
+                if let Err(reason) = self.schedule_next(ctx) {
+                    return ActorTurn::Stop(reason);
+                }
                 ActorTurn::Continue
             }
             _ => ActorTurn::Continue,
@@ -192,14 +203,14 @@ impl Actor for Inspector {
     }
 }
 
-fn main() {
+fn run() -> Result<(), String> {
     let mut runtime = LocalRuntime::new(SchedulerConfig::default());
     let light = runtime
         .spawn_gen_statem(TrafficLight::new(Duration::from_millis(20)))
-        .expect("spawn light");
+        .map_err(|error| format!("spawn light failed: {error:?}"))?;
     runtime
         .spawn(Inspector::new(light))
-        .expect("spawn inspector");
+        .map_err(|error| format!("spawn inspector failed: {error:?}"))?;
 
     for _ in 0..20 {
         if !runtime.block_on_next(Some(Duration::from_millis(40))) {
@@ -208,4 +219,13 @@ fn main() {
     }
 
     println!("final snapshot: {:?}", runtime.actor_snapshot(light));
+
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }

@@ -1,10 +1,13 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "common/support.rs"]
+mod support;
 
 use lamport::{
-    Actor, ActorId, ActorStatus, ActorTurn, Application, CallOutcome, ChildSpec, Context,
-    DownMessage, Envelope, ExitReason, GenServer, Restart, ServerOutcome, Shutdown, SpawnOptions,
-    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken,
-    behaviour::RuntimeInfo, boot_local_application, restart_scope,
+    Actor, ActorId, ActorTurn, Application, CallOutcome, ChildSpec, Context, DownMessage, Envelope,
+    ExitReason, GenServer, Restart, ServerOutcome, Shutdown, SpawnOptions, StartChildError,
+    Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken, behaviour::RuntimeInfo,
+    boot_local_application, restart_scope,
 };
 
 const WORKER_CHILD: &str = "worker";
@@ -237,27 +240,9 @@ impl Application for RecoveryApplication {
     }
 }
 
-fn wait_until_dead(runtime: &mut lamport::LocalRuntime, actor: ActorId) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-
-    while Instant::now() < deadline {
-        if runtime
-            .actor_snapshot(actor)
-            .is_some_and(|snapshot| snapshot.status == ActorStatus::Dead)
-        {
-            return;
-        }
-
-        let _ = runtime.block_on_next(Some(Duration::from_millis(50)));
-        runtime.run_until_idle();
-    }
-
-    panic!("actor {actor} did not terminate in time");
-}
-
-fn main() {
-    let (mut runtime, app) =
-        boot_local_application(RecoveryApplication, Default::default()).expect("boot app");
+fn run() -> Result<(), String> {
+    let (mut runtime, app) = boot_local_application(RecoveryApplication, Default::default())
+        .map_err(|error| format!("boot app failed: {error:?}"))?;
     let root = app.root_supervisor();
 
     println!(
@@ -267,14 +252,14 @@ fn main() {
 
     runtime
         .spawn(MonitorProbe::new(WORKER_NAME))
-        .expect("spawn monitor");
+        .map_err(|error| format!("spawn monitor failed: {error:?}"))?;
     runtime.run_until_idle();
 
-    wait_until_dead(&mut runtime, root);
+    support::wait_until_local_actor_dead(&mut runtime, root, Duration::from_secs(2))?;
 
     let root_snapshot = runtime
         .actor_snapshot(root)
-        .expect("root snapshot should exist");
+        .ok_or_else(|| format!("root snapshot for {root} should exist"))?;
 
     println!("application {} root supervisor {}", app.name(), root);
     println!("root status: {:?}", root_snapshot.status);
@@ -285,5 +270,14 @@ fn main() {
 
     if let Some(report) = runtime.crash_reports().last() {
         println!("last crash report: {report}");
+    }
+
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }

@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Duration};
 
 mod support;
 
@@ -10,7 +7,7 @@ use lamport::{
     LifecycleEvent, LocalRuntime, Restart, Shutdown, SpawnOptions, StartChildError, Strategy,
     Supervisor, SupervisorDirective, SupervisorFlags, restart_scope, supervisor::SupervisorActor,
 };
-use support::map_spawn_error;
+use support::{map_spawn_error, wait_until_local, wait_until_local_dead};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
@@ -100,24 +97,6 @@ fn child_ids(runtime: &mut LocalRuntime, supervisor: ActorId) -> BTreeMap<&'stat
         .collect()
 }
 
-fn wait_until_dead(runtime: &mut LocalRuntime, actor: ActorId) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-
-    while Instant::now() < deadline {
-        if runtime
-            .actor_snapshot(actor)
-            .is_some_and(|snapshot| snapshot.status == ActorStatus::Dead)
-        {
-            return;
-        }
-
-        let _ = runtime.block_on_next(Some(Duration::from_millis(50)));
-        runtime.run_until_idle();
-    }
-
-    panic!("actor {actor:?} did not terminate in time");
-}
-
 #[test]
 fn restart_window_expires_before_the_next_failure() {
     let mut runtime = LocalRuntime::default();
@@ -148,7 +127,16 @@ fn restart_window_expires_before_the_next_failure() {
         1
     );
 
-    std::thread::sleep(Duration::from_millis(70));
+    wait_until_local(
+        &mut runtime,
+        Duration::from_millis(120),
+        "restart intensity window to expire",
+        |runtime| {
+            runtime
+                .supervisor_snapshot(supervisor)
+                .is_some_and(|snapshot| snapshot.active_restarts == 0)
+        },
+    );
     assert_eq!(
         runtime
             .supervisor_snapshot(supervisor)
@@ -205,7 +193,7 @@ fn restart_intensity_shutdown_terminates_the_running_subtree() {
         .send(second_generation["b"], Control::Crash)
         .unwrap();
     runtime.run_until_idle();
-    wait_until_dead(&mut runtime, supervisor);
+    wait_until_local_dead(&mut runtime, supervisor, Duration::from_secs(2));
 
     let supervisor_snapshot = runtime.actor_snapshot(supervisor).unwrap();
     assert_eq!(supervisor_snapshot.status, ActorStatus::Dead);

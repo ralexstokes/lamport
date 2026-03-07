@@ -1,19 +1,20 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 mod support;
 
 use lamport::{
-    Actor, ActorId, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec, ConcurrentRuntime,
-    Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome,
-    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
-    TimerToken, behaviour::RuntimeInfo, boot_concurrent_application, restart_scope,
+    Actor, ActorId, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec, Context, Envelope,
+    ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome, SpawnOptions,
+    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken,
+    behaviour::RuntimeInfo, boot_concurrent_application, restart_scope,
 };
-use support::map_spawn_error;
+use support::{
+    expect_downcast, expect_some, map_spawn_error, wait_until_concurrent, wait_until_local,
+};
 
 const CHAT_LEAVE_DELAY: Duration = Duration::from_millis(40);
 const CHAT_SPEAK_DELAY: Duration = Duration::from_millis(5);
@@ -139,11 +140,18 @@ struct ChatClient {
     script: VecDeque<String>,
     speak_token: TimerToken,
     leave_token: TimerToken,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Mutex<Vec<ChatLogEvent>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatLogEvent {
+    Joined { name: String },
+    Left { name: String },
+    Message { from: String, text: String },
 }
 
 impl ChatClient {
-    fn new(name: &str, room: ActorId, script: &[&str], log: Arc<Mutex<Vec<String>>>) -> Self {
+    fn new(name: &str, room: ActorId, script: &[&str], log: Arc<Mutex<Vec<ChatLogEvent>>>) -> Self {
         Self {
             name: name.to_owned(),
             room,
@@ -182,7 +190,7 @@ impl Actor for ChatClient {
     fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
         match envelope {
             Envelope::Reply { message, .. } => {
-                let reply = message.downcast::<ChatReply>().ok().unwrap();
+                let reply = expect_downcast::<ChatReply>(message, "chat join reply");
                 if let ChatReply::Joined = reply
                     && let Err(reason) = self.schedule_speak(ctx)
                 {
@@ -190,13 +198,13 @@ impl Actor for ChatClient {
                 }
             }
             Envelope::User(payload) => {
-                let event = payload.downcast::<ChatEvent>().ok().unwrap();
-                let line = match event {
-                    ChatEvent::Joined { name } => format!("join:{name}"),
-                    ChatEvent::Left { name } => format!("left:{name}"),
-                    ChatEvent::Message { from, text } => format!("msg:{from}:{text}"),
+                let event = expect_downcast::<ChatEvent>(payload, "chat event");
+                let entry = match event {
+                    ChatEvent::Joined { name } => ChatLogEvent::Joined { name },
+                    ChatEvent::Left { name } => ChatLogEvent::Left { name },
+                    ChatEvent::Message { from, text } => ChatLogEvent::Message { from, text },
                 };
-                self.log.lock().unwrap().push(line);
+                self.log.lock().unwrap().push(entry);
             }
             Envelope::Timer(timer) if timer.token == self.speak_token => {
                 if let Some(line) = self.script.pop_front()
@@ -258,7 +266,7 @@ impl Actor for ChatSnapshotClient {
 
     fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
         if let Envelope::Reply { message, .. } = envelope {
-            let snapshot = message.downcast::<ChatReply>().ok().unwrap();
+            let snapshot = expect_downcast::<ChatReply>(message, "chat snapshot reply");
             if let ChatReply::Snapshot {
                 members,
                 transcript,
@@ -349,7 +357,7 @@ impl Actor for ServiceClient {
             self.results
                 .lock()
                 .unwrap()
-                .push(message.downcast::<u64>().ok().unwrap());
+                .push(expect_downcast::<u64>(message, "service add reply"));
             return ActorTurn::Stop(ExitReason::Normal);
         }
 
@@ -376,7 +384,7 @@ impl Actor for ServiceSnapshotClient {
             self.seen
                 .lock()
                 .unwrap()
-                .push(message.downcast::<u64>().ok().unwrap());
+                .push(expect_downcast::<u64>(message, "service snapshot reply"));
             return ActorTurn::Stop(ExitReason::Normal);
         }
 
@@ -466,40 +474,6 @@ impl Application for ServiceApplication {
     }
 }
 
-fn wait_for_local_actors(runtime: &mut LocalRuntime, actors: &[ActorId]) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-
-    while Instant::now() < deadline {
-        if actors.iter().all(|actor| {
-            runtime
-                .actor_snapshot(*actor)
-                .is_some_and(|snapshot| snapshot.status == lamport::ActorStatus::Dead)
-        }) {
-            return;
-        }
-
-        let _ = runtime.block_on_next(Some(Duration::from_millis(50)));
-        runtime.run_until_idle();
-    }
-
-    panic!("actors did not finish in time");
-}
-
-fn wait_for_results(runtime: &ConcurrentRuntime, results: &Arc<Mutex<Vec<u64>>>, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-
-    while Instant::now() < deadline {
-        if results.lock().unwrap().len() == expected {
-            return;
-        }
-
-        let _ = runtime.wait_for_idle(Some(Duration::from_millis(50)));
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    panic!("concurrent workload did not complete in time");
-}
-
 fn sorted(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values
@@ -514,7 +488,7 @@ fn chat_style_workload_preserves_membership_and_message_flow() {
     let bob_log = Arc::new(Mutex::new(Vec::new()));
     let carol_log = Arc::new(Mutex::new(Vec::new()));
 
-    let actors = vec![
+    let actors = [
         runtime
             .spawn(ChatClient::new(
                 "alice",
@@ -542,7 +516,18 @@ fn chat_style_workload_preserves_membership_and_message_flow() {
     ];
 
     runtime.run_until_idle();
-    wait_for_local_actors(&mut runtime, &actors);
+    wait_until_local(
+        &mut runtime,
+        Duration::from_secs(2),
+        "chat clients to finish",
+        |runtime| {
+            actors.iter().all(|actor| {
+                runtime
+                    .actor_snapshot(*actor)
+                    .is_some_and(|snapshot| snapshot.status == lamport::ActorStatus::Dead)
+            })
+        },
+    );
 
     let snapshot = Arc::new(Mutex::new(None));
     runtime
@@ -554,7 +539,7 @@ fn chat_style_workload_preserves_membership_and_message_flow() {
     runtime.run_until_idle();
 
     let snapshot = snapshot.lock().unwrap();
-    let snapshot = snapshot.as_ref().unwrap();
+    let snapshot = expect_some(snapshot.as_ref().cloned(), "captured chat snapshot");
     assert!(snapshot.members.is_empty());
     let expected = vec![
         "alice:hello".to_owned(),
@@ -570,14 +555,34 @@ fn chat_style_workload_preserves_membership_and_message_flow() {
     let bob = bob_log.lock().unwrap().clone();
     let carol = carol_log.lock().unwrap().clone();
 
-    assert!(alice.iter().any(|event| event == "join:bob"));
-    assert!(alice.iter().any(|event| event == "join:carol"));
-    assert!(alice.iter().any(|event| event == "msg:bob:one"));
-    assert!(alice.iter().any(|event| event == "msg:carol:red"));
-    assert!(bob.iter().any(|event| event == "msg:alice:hello"));
-    assert!(bob.iter().any(|event| event == "msg:carol:red"));
-    assert!(carol.iter().any(|event| event == "msg:alice:hello"));
-    assert!(carol.iter().any(|event| event == "msg:bob:one"));
+    assert!(alice.contains(&ChatLogEvent::Joined { name: "bob".into() }));
+    assert!(alice.contains(&ChatLogEvent::Joined {
+        name: "carol".into()
+    }));
+    assert!(alice.contains(&ChatLogEvent::Message {
+        from: "bob".into(),
+        text: "one".into(),
+    }));
+    assert!(alice.contains(&ChatLogEvent::Message {
+        from: "carol".into(),
+        text: "red".into(),
+    }));
+    assert!(bob.contains(&ChatLogEvent::Message {
+        from: "alice".into(),
+        text: "hello".into(),
+    }));
+    assert!(bob.contains(&ChatLogEvent::Message {
+        from: "carol".into(),
+        text: "red".into(),
+    }));
+    assert!(carol.contains(&ChatLogEvent::Message {
+        from: "alice".into(),
+        text: "hello".into(),
+    }));
+    assert!(carol.contains(&ChatLogEvent::Message {
+        from: "bob".into(),
+        text: "one".into(),
+    }));
 }
 
 #[test]
@@ -601,7 +606,12 @@ fn service_style_workload_handles_parallel_request_reply_traffic() {
             .unwrap();
     }
 
-    wait_for_results(&runtime, &replies, 32);
+    wait_until_concurrent(
+        &runtime,
+        Duration::from_secs(3),
+        "parallel service replies",
+        |_runtime| replies.lock().unwrap().len() == 32,
+    );
 
     let mut replies = replies.lock().unwrap().clone();
     replies.sort_unstable();
@@ -613,6 +623,11 @@ fn service_style_workload_handles_parallel_request_reply_traffic() {
             seen: Arc::clone(&snapshot),
         })
         .unwrap();
-    wait_for_results(&runtime, &snapshot, 1);
+    wait_until_concurrent(
+        &runtime,
+        Duration::from_secs(3),
+        "service snapshot reply",
+        |_runtime| snapshot.lock().unwrap().len() == 1,
+    );
     assert_eq!(snapshot.lock().unwrap().as_slice(), &[32]);
 }

@@ -1,6 +1,6 @@
 use crate::{
     envelope::{DownMessage, Envelope, ExitSignal},
-    internal::classify_exit_signal,
+    internal::{classify_exit_signal, shutdown_link_reason},
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     types::{ActorId, ActorStatus, ExitReason},
 };
@@ -187,11 +187,7 @@ impl RuntimeShared {
             );
         }
 
-        let linked_reason = if shutdown_requested && matches!(final_reason, ExitReason::Kill) {
-            ExitReason::Shutdown
-        } else {
-            final_reason.clone()
-        };
+        let linked_reason = shutdown_link_reason(shutdown_requested, &final_reason);
 
         for linked_actor in linked {
             if linked_actor == actor {
