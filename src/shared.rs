@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::Instant,
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use tokio::task::JoinHandle;
 
@@ -93,4 +90,3 @@ pub(crate) fn mailbox_overflow_reason(actor: ActorId, label: &str) -> ExitReason
         "actor `{actor:?}` mailbox overflow while delivering {label}"
     ))
 }
-

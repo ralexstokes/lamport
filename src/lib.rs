@@ -42,8 +42,8 @@ pub mod observability;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
-pub mod supervisor;
 pub(crate) mod shared;
+pub mod supervisor;
 pub mod types;
 
 pub use actor::{Actor, ActorTurn};

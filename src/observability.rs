@@ -144,16 +144,66 @@ impl RuntimeMetricsSnapshot {
             .as_secs_f64();
 
         let scalars: &[(&str, &str, &str, &dyn fmt::Display)] = &[
-            ("lamport_runtime_observed_at_seconds", "Unix timestamp when the runtime metrics snapshot was captured.", "gauge", &observed_at),
-            ("lamport_runtime_live_actors", "Current number of live actors in the runtime.", "gauge", &self.live_actors),
-            ("lamport_runtime_completed_actors", "Number of completed actor snapshots retained for introspection.", "gauge", &self.completed_actors),
-            ("lamport_runtime_mailbox_messages", "Total number of messages queued across live actor mailboxes.", "gauge", &self.total_mailbox_len),
-            ("lamport_runtime_mailbox_max_messages", "Largest mailbox length across live actors.", "gauge", &self.max_mailbox_len),
-            ("lamport_scheduler_utilization_ratio", "Estimated fraction of busy scheduler time over the runtime lifetime.", "gauge", &self.scheduler_metrics.utilization),
-            ("lamport_scheduler_normal_turns_total", "Total actor turns executed on normal schedulers.", "counter", &self.scheduler_metrics.normal_turns),
-            ("lamport_scheduler_idle_turns_total", "Total idle polling turns observed by schedulers.", "counter", &self.scheduler_metrics.idle_turns),
-            ("lamport_scheduler_blocking_io_jobs_total", "Total jobs submitted to the blocking I/O pool.", "counter", &self.scheduler_metrics.blocking_io_jobs),
-            ("lamport_scheduler_blocking_cpu_jobs_total", "Total jobs submitted to the blocking CPU pool.", "counter", &self.scheduler_metrics.blocking_cpu_jobs),
+            (
+                "lamport_runtime_observed_at_seconds",
+                "Unix timestamp when the runtime metrics snapshot was captured.",
+                "gauge",
+                &observed_at,
+            ),
+            (
+                "lamport_runtime_live_actors",
+                "Current number of live actors in the runtime.",
+                "gauge",
+                &self.live_actors,
+            ),
+            (
+                "lamport_runtime_completed_actors",
+                "Number of completed actor snapshots retained for introspection.",
+                "gauge",
+                &self.completed_actors,
+            ),
+            (
+                "lamport_runtime_mailbox_messages",
+                "Total number of messages queued across live actor mailboxes.",
+                "gauge",
+                &self.total_mailbox_len,
+            ),
+            (
+                "lamport_runtime_mailbox_max_messages",
+                "Largest mailbox length across live actors.",
+                "gauge",
+                &self.max_mailbox_len,
+            ),
+            (
+                "lamport_scheduler_utilization_ratio",
+                "Estimated fraction of busy scheduler time over the runtime lifetime.",
+                "gauge",
+                &self.scheduler_metrics.utilization,
+            ),
+            (
+                "lamport_scheduler_normal_turns_total",
+                "Total actor turns executed on normal schedulers.",
+                "counter",
+                &self.scheduler_metrics.normal_turns,
+            ),
+            (
+                "lamport_scheduler_idle_turns_total",
+                "Total idle polling turns observed by schedulers.",
+                "counter",
+                &self.scheduler_metrics.idle_turns,
+            ),
+            (
+                "lamport_scheduler_blocking_io_jobs_total",
+                "Total jobs submitted to the blocking I/O pool.",
+                "counter",
+                &self.scheduler_metrics.blocking_io_jobs,
+            ),
+            (
+                "lamport_scheduler_blocking_cpu_jobs_total",
+                "Total jobs submitted to the blocking CPU pool.",
+                "counter",
+                &self.scheduler_metrics.blocking_cpu_jobs,
+            ),
         ];
         for (name, help, metric_type, value) in scalars {
             write_scalar_metric(&mut output, name, help, metric_type, value);

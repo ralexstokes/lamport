@@ -99,8 +99,7 @@ pub struct SupervisorSnapshot {
 }
 
 use crate::shared::{
-    ShutdownTracker, SupervisorRuntimeState, TurnEffects,
-    mailbox_overflow_reason, panic_reason,
+    ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason, panic_reason,
 };
 
 #[derive(Debug)]
