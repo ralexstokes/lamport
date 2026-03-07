@@ -5,7 +5,12 @@ use crate::{
     types::ExitReason,
 };
 
-use super::{CastMessage, InfoMessage, RuntimeInfo, envelope_to_runtime_info};
+use super::{
+    RuntimeInfo,
+    adapter::{
+        DispatchEnvelope, UserMessage, classify_envelope, downcast_payload, downcast_user_message,
+    },
+};
 
 /// Outcome of handling a synchronous `call`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,14 +139,9 @@ where
         message: Payload,
         ctx: &mut C,
     ) -> ActorTurn {
-        let call = match message.downcast::<G::Call>() {
+        let call = match downcast_payload::<G::Call>(message, "call") {
             Ok(call) => call,
-            Err(message) => {
-                return ActorTurn::Stop(ExitReason::Error(format!(
-                    "unexpected call payload `{}`",
-                    message.type_name()
-                )));
-            }
+            Err(turn) => return turn,
         };
 
         let (server, state) = self.server_and_state_mut();
@@ -160,21 +160,16 @@ where
     }
 
     fn handle_user<C: Context>(&mut self, payload: Payload, ctx: &mut C) -> ActorTurn {
-        match payload.downcast::<CastMessage<G::Cast>>() {
-            Ok(CastMessage(message)) => {
+        match downcast_user_message::<G::Cast, G::Info>(payload, "server") {
+            Ok(UserMessage::Cast(message)) => {
                 let (server, state) = self.server_and_state_mut();
                 map_server_outcome(server.handle_cast(state, message, ctx))
             }
-            Err(payload) => match payload.downcast::<InfoMessage<G::Info>>() {
-                Ok(InfoMessage(message)) => {
-                    let (server, state) = self.server_and_state_mut();
-                    map_server_outcome(server.handle_info(state, message, ctx))
-                }
-                Err(payload) => ActorTurn::Stop(ExitReason::Error(format!(
-                    "unexpected user payload `{}`",
-                    payload.type_name()
-                ))),
-            },
+            Ok(UserMessage::Info(message)) => {
+                let (server, state) = self.server_and_state_mut();
+                map_server_outcome(server.handle_info(state, message, ctx))
+            }
+            Err(turn) => turn,
         }
     }
 
@@ -200,14 +195,10 @@ where
     }
 
     fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
-        match envelope {
-            Envelope::Request { token, message } => self.handle_call(token, message, ctx),
-            Envelope::User(payload) => self.handle_user(payload, ctx),
-            other => {
-                let info = envelope_to_runtime_info(other)
-                    .expect("all non-Request/User envelope variants are covered");
-                self.handle_runtime_info(info, ctx)
-            }
+        match classify_envelope(envelope) {
+            DispatchEnvelope::Request { token, message } => self.handle_call(token, message, ctx),
+            DispatchEnvelope::User(payload) => self.handle_user(payload, ctx),
+            DispatchEnvelope::Runtime(info) => self.handle_runtime_info(info, ctx),
         }
     }
 

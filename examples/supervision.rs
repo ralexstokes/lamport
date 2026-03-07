@@ -2,9 +2,9 @@ use std::time::{Duration, Instant};
 
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, Application, CallOutcome, ChildSpec, Context,
-    DownMessage, Envelope, ExitReason, GenServer, Restart, RuntimeInfo, ServerOutcome, Shutdown,
-    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
-    TimerToken, boot_local_application, restart_scope,
+    DownMessage, Envelope, ExitReason, GenServer, Restart, ServerOutcome, Shutdown, SpawnOptions,
+    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken,
+    behaviour::RuntimeInfo, boot_local_application, restart_scope,
 };
 
 const WORKER_CHILD: &str = "worker";

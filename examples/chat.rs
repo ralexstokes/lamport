@@ -5,8 +5,8 @@ use std::{
 
 use lamport::{
     Actor, ActorId, ActorTurn, CallOutcome, CastMessage, ChildSpec, Context, Envelope, ExitReason,
-    GenServer, LocalRuntime, ReplyToken, Restart, RuntimeInfo, ServerOutcome, Shutdown,
-    StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken,
+    GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome, Shutdown, StartChildError,
+    Strategy, Supervisor, SupervisorDirective, SupervisorFlags, TimerToken, behaviour::RuntimeInfo,
 };
 
 const ROOM_CHILD: &str = "room";

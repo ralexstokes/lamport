@@ -8,7 +8,7 @@ mod support;
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, ChildSpec, Context, Envelope, ExitReason,
     LifecycleEvent, LocalRuntime, Restart, Shutdown, SpawnOptions, StartChildError, Strategy,
-    Supervisor, SupervisorActor, SupervisorDirective, SupervisorFlags, restart_scope,
+    Supervisor, SupervisorDirective, SupervisorFlags, restart_scope, supervisor::SupervisorActor,
 };
 use support::map_spawn_error;
 

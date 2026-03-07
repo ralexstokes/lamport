@@ -9,9 +9,9 @@ mod support;
 
 use lamport::{
     Actor, ActorId, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec, ConcurrentRuntime,
-    Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, RuntimeInfo,
-    ServerOutcome, SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective,
-    SupervisorFlags, TimerToken, boot_concurrent_application, restart_scope,
+    Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome,
+    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
+    TimerToken, behaviour::RuntimeInfo, boot_concurrent_application, restart_scope,
 };
 use support::map_spawn_error;
 

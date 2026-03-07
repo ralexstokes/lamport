@@ -7,8 +7,8 @@ use std::{
 };
 
 use lamport::{
-    Actor, ActorTurn, Context, Envelope, ExitReason, LocalRuntime, Mailbox, SchedulerConfig,
-    SpawnOptions, TimerToken,
+    Actor, ActorTurn, Context, Envelope, ExitReason, LocalRuntime, SchedulerConfig, SpawnOptions,
+    TimerToken, mailbox::Mailbox,
 };
 
 struct SinkActor;

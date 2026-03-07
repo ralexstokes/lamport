@@ -1,4 +1,4 @@
-use lamport::{Envelope, Mailbox};
+use lamport::{Envelope, mailbox::Mailbox};
 
 #[derive(Clone, Copy)]
 struct Lcg(u64);

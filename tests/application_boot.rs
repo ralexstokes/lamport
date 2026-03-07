@@ -5,9 +5,9 @@ use std::sync::{
 
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec,
-    Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, RuntimeInfo,
-    ServerOutcome, Shutdown, SpawnOptions, StartChildError, Strategy, Supervisor,
-    SupervisorDirective, SupervisorFlags, boot_local_application, restart_scope,
+    Context, Envelope, ExitReason, GenServer, LocalRuntime, ReplyToken, Restart, ServerOutcome,
+    Shutdown, SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective,
+    SupervisorFlags, behaviour::RuntimeInfo, boot_local_application, restart_scope,
 };
 
 const ROOT_NAME: &str = "integration.root";

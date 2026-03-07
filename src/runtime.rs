@@ -1,3 +1,5 @@
+mod lifecycle;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -11,10 +13,14 @@ use crate::{
     actor::{Actor, ActorTurn},
     behaviour::{GenServer, GenServerActor, GenStatem, GenStatemActor, RuntimeInfo},
     context::{
-        Context, LinkError, MonitorError, PendingCall, SendError, SpawnError, SpawnOptions,
-        TaskHandle, TimerError,
+        ActorContext, LifecycleContext, LinkError, MonitorError, PendingCall, SendError,
+        SpawnError, SpawnOptions, SupervisorContext, TaskHandle, TimerError,
     },
     envelope::{DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted, TimerFired},
+    internal::{
+        ExitDisposition, ShutdownTracker, SupervisorRuntimeState, TurnEffects,
+        classify_exit_signal, mailbox_overflow_reason, normalize_scheduler_config, panic_reason,
+    },
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     mailbox::{Mailbox, MailboxFull},
     observability::{
@@ -50,10 +56,6 @@ enum DriverEvent {
         reference: Ref,
     },
 }
-
-use crate::shared::{
-    ShutdownTracker, SupervisorRuntimeState, TurnEffects, mailbox_overflow_reason, panic_reason,
-};
 
 #[derive(Debug)]
 struct ActorState {
@@ -216,21 +218,13 @@ impl<'a> LocalContext<'a> {
     }
 
     fn handle_current_exit_signal(&mut self, signal: ExitSignal) {
-        let kill_now = matches!(signal.reason, ExitReason::Kill)
-            || (signal.linked
-                && !self.current.trap_exit
-                && !matches!(signal.reason, ExitReason::Normal));
-
-        if kill_now {
-            self.effects.exit_reason = Some(signal.reason);
-            return;
+        match classify_exit_signal(self.current.trap_exit, &signal) {
+            ExitDisposition::KillNow => self.effects.exit_reason = Some(signal.reason),
+            ExitDisposition::Ignore => {}
+            ExitDisposition::Enqueue => {
+                self.enqueue_self_runtime_envelope(Envelope::Exit(signal), "exit");
+            }
         }
-
-        if signal.linked && !self.current.trap_exit && matches!(signal.reason, ExitReason::Normal) {
-            return;
-        }
-
-        self.enqueue_self_runtime_envelope(Envelope::Exit(signal), "exit");
     }
 
     fn spawn_inner<A: Actor>(
@@ -376,7 +370,7 @@ impl<'a> LocalContext<'a> {
     }
 }
 
-impl Context for LocalContext<'_> {
+impl ActorContext for LocalContext<'_> {
     fn actor_id(&self) -> ActorId {
         self.current.id
     }
@@ -483,6 +477,27 @@ impl Context for LocalContext<'_> {
         self.effects.exit_reason = Some(reason);
     }
 
+    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
+        let linked = self.current.links.contains(&actor);
+        let reason = ExitReason::Shutdown;
+        let result = self
+            .runtime
+            .request_shutdown(self.current.id, actor, policy);
+
+        if result.is_ok() && linked && !self.runtime.contains(actor) {
+            self.current.links.remove(&actor);
+            self.handle_current_exit_signal(ExitSignal {
+                from: actor,
+                reason,
+                linked: true,
+            });
+        }
+
+        result
+    }
+}
+
+impl SupervisorContext for LocalContext<'_> {
     fn configure_supervisor(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
         self.current.supervisor = Some(SupervisorRuntimeState::new(flags, child_specs));
     }
@@ -512,26 +527,9 @@ impl Context for LocalContext<'_> {
             supervisor.clear_running(child_id, actor);
         }
     }
+}
 
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
-        let linked = self.current.links.contains(&actor);
-        let reason = ExitReason::Shutdown;
-        let result = self
-            .runtime
-            .request_shutdown(self.current.id, actor, policy);
-
-        if result.is_ok() && linked && !self.runtime.contains(actor) {
-            self.current.links.remove(&actor);
-            self.handle_current_exit_signal(ExitSignal {
-                from: actor,
-                reason,
-                linked: true,
-            });
-        }
-
-        result
-    }
-
+impl LifecycleContext for LocalContext<'_> {
     fn emit_lifecycle_event(&mut self, event: LifecycleEvent) {
         self.runtime.record_lifecycle_event(event);
     }
@@ -571,7 +569,8 @@ impl Default for LocalRuntime {
 impl LocalRuntime {
     /// Creates a new runtime and returns any Tokio initialization error.
     pub fn try_new(config: SchedulerConfig) -> Result<Self, std::io::Error> {
-        let config = normalize_config(config);
+        let mut config = normalize_scheduler_config(config);
+        config.scheduler_count = 1;
 
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -611,6 +610,16 @@ impl LocalRuntime {
     /// Creates a new runtime with a single local scheduler and configurable pool sizes.
     pub fn new(config: SchedulerConfig) -> Self {
         Self::try_new(config).expect("failed to initialize Tokio runtime for lamport")
+    }
+
+    /// Boots an application root supervisor into an existing local runtime.
+    pub fn boot_application<A: crate::application::Application>(
+        &mut self,
+        application: A,
+    ) -> Result<crate::application::ApplicationHandle, SpawnError> {
+        let (name, options, root_supervisor) = crate::application::prepare_application(application);
+        let root = self.spawn_supervisor_with_options(root_supervisor, options)?;
+        Ok(crate::application::ApplicationHandle::new(name, root))
     }
 
     /// Returns the scheduler configuration used by the runtime.
@@ -1177,298 +1186,6 @@ impl LocalRuntime {
         }
     }
 
-    fn run_init(&mut self, mut entry: ActorEntry) {
-        entry.state.status = ActorStatus::Running;
-        entry.state.metrics.scheduler_id = Some(0);
-
-        let (init_result, effects) = {
-            let actor_id = entry.state.id;
-            let actor_name = entry.name;
-            let mut ctx = LocalContext::new(self, &mut entry.state);
-            let init_span = tracing::debug_span!(
-                "lamport.actor.init",
-                actor_id = %actor_id,
-                actor_name = actor_name,
-                scheduler_id = 0usize
-            );
-            let _init_guard = init_span.enter();
-            let result = catch_unwind(AssertUnwindSafe(|| entry.actor.init(&mut ctx)));
-            let effects = ctx.finish();
-            (result, effects)
-        };
-
-        match init_result {
-            Ok(Ok(())) => {
-                entry.state.initialized = true;
-
-                if let Some(reason) = effects.exit_reason {
-                    self.finish_actor(entry, reason);
-                    return;
-                }
-
-                self.return_actor(entry);
-            }
-            Ok(Err(reason)) => self.finish_actor(entry, reason),
-            Err(panic) => {
-                let actor_id = entry.state.id;
-                let name = entry.name;
-                self.finish_actor(entry, panic_reason(actor_id, name, panic));
-            }
-        }
-    }
-
-    fn return_actor(&mut self, mut entry: ActorEntry) {
-        entry.state.metrics.mailbox_len = entry.state.mailbox.len();
-        entry.state.metrics.scheduler_id = None;
-
-        if entry.state.mailbox.is_empty() {
-            park_actor(&mut entry.state);
-        } else {
-            entry.state.status = ActorStatus::Runnable;
-            schedule_actor(&mut self.run_queue, &mut entry.state);
-        }
-
-        self.actors.insert(entry.state.id.local_id, entry);
-    }
-
-    fn finish_actor(&mut self, mut entry: ActorEntry, reason: ExitReason) {
-        entry.state.status = ActorStatus::Exiting;
-        entry.state.metrics.scheduler_id = Some(0);
-
-        let terminate_result = {
-            let actor_id = entry.state.id;
-            let actor_name = entry.name;
-            let mut ctx = LocalContext::new(self, &mut entry.state);
-            let terminate_span = tracing::debug_span!(
-                "lamport.actor.terminate",
-                actor_id = %actor_id,
-                actor_name = actor_name,
-                scheduler_id = 0usize,
-                reason = %reason
-            );
-            let _terminate_guard = terminate_span.enter();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                entry.actor.terminate(reason.clone(), &mut ctx);
-            }));
-            let _ = ctx.finish();
-            result
-        };
-
-        let final_reason = match terminate_result {
-            Ok(()) => reason,
-            Err(panic) => panic_reason(entry.state.id, entry.name, panic),
-        };
-
-        self.registry.unregister(entry.state.id);
-
-        self.cancel_all_timers(entry.state.id);
-        self.cancel_all_call_timeouts(entry.state.id);
-
-        let actor_id = entry.state.id;
-        let parent = entry.state.parent;
-        let ancestors = entry.state.ancestors.clone();
-        let registered_name = entry.state.registered_name.clone();
-        let supervisor_child = entry.state.supervisor_child;
-        let linked: Vec<_> = entry.state.links.iter().copied().collect();
-        let monitored_by: Vec<_> = entry
-            .state
-            .monitors_in
-            .iter()
-            .map(|(reference, watcher)| (*reference, *watcher))
-            .collect();
-        let monitoring: Vec<_> = entry
-            .state
-            .monitors_out
-            .iter()
-            .map(|(reference, target)| (*reference, *target))
-            .collect();
-        let linked_reason = if self.shutdown_tasks.contains_key(&actor_id)
-            && matches!(final_reason, ExitReason::Kill)
-        {
-            ExitReason::Shutdown
-        } else {
-            final_reason.clone()
-        };
-
-        if let (Some(parent), Some(child_id)) = (parent, supervisor_child)
-            && let Some(parent_state) = self.actor_state_mut(parent)
-            && let Some(supervisor) = parent_state.supervisor.as_mut()
-        {
-            supervisor.clear_running(child_id, actor_id);
-        }
-
-        self.remove_outgoing_monitors(actor_id, monitoring);
-        self.notify_incoming_monitors(actor_id, &final_reason, monitored_by);
-        self.detach_links_and_propagate(actor_id, &linked_reason, linked);
-
-        if let Some(mut tracker) = self.shutdown_tasks.remove(&actor_id) {
-            if let Some(task) = tracker.task.take() {
-                task.abort();
-            }
-
-            self.record_lifecycle_event(LifecycleEvent::Shutdown {
-                requester: tracker.requester,
-                actor: actor_id,
-                policy: tracker.policy,
-                phase: ShutdownPhase::Completed,
-                reason: Some(final_reason.clone()),
-            });
-        }
-
-        entry.state.status = ActorStatus::Dead;
-        entry.state.metrics.last_exit = Some(final_reason.clone());
-        entry.state.metrics.mailbox_len = 0;
-        entry.state.metrics.scheduler_id = None;
-        entry.state.scheduled = false;
-        entry.state.registered_name = None;
-
-        self.record_lifecycle_event(LifecycleEvent::Exit {
-            actor: actor_id,
-            name: entry.name,
-            reason: final_reason.clone(),
-            parent,
-            ancestors: ancestors.clone(),
-        });
-
-        if !matches!(final_reason, ExitReason::Normal | ExitReason::Shutdown) {
-            let parent_context = parent.and_then(|parent| self.actor_identity(parent));
-            let ancestor_contexts = ancestors
-                .iter()
-                .filter_map(|ancestor| self.actor_identity(*ancestor))
-                .collect();
-            self.record_crash_report(CrashReport {
-                actor: actor_id,
-                name: entry.name,
-                registered_name,
-                parent,
-                parent_context,
-                ancestors: ancestors.clone(),
-                ancestor_contexts,
-                supervisor_child,
-                reason: final_reason.clone(),
-            });
-        }
-
-        let id = entry.state.id;
-        self.completed.insert(id, entry.snapshot());
-        self.live_actors = self.live_actors.saturating_sub(1);
-    }
-
-    fn remove_outgoing_monitors(&mut self, actor: ActorId, monitoring: Vec<(Ref, ActorId)>) {
-        for (reference, target) in monitoring {
-            if target == actor {
-                continue;
-            }
-
-            if let Some(target_state) = self.actor_state_mut(target) {
-                target_state.monitors_in.remove(&reference);
-            }
-        }
-    }
-
-    fn notify_incoming_monitors(
-        &mut self,
-        actor: ActorId,
-        reason: &ExitReason,
-        monitored_by: Vec<(Ref, ActorId)>,
-    ) {
-        for (reference, watcher) in monitored_by {
-            if watcher == actor {
-                continue;
-            }
-
-            let scheduled = if let Some(watcher_state) = self.actor_state_mut(watcher) {
-                watcher_state.monitors_out.remove(&reference);
-                push_envelope(
-                    watcher_state,
-                    Envelope::Down(DownMessage {
-                        reference,
-                        actor,
-                        reason: reason.clone(),
-                    }),
-                )
-            } else {
-                Ok(None)
-            };
-
-            match scheduled {
-                Ok(Some(actor_id)) => self.run_queue.push_back(actor_id),
-                Ok(None) => {}
-                Err(SendError::MailboxFull { .. }) => {
-                    self.force_exit(watcher, mailbox_overflow_reason(watcher, "down"));
-                }
-                Err(SendError::NoProc(_)) => {}
-            }
-
-            self.record_lifecycle_event(LifecycleEvent::Down {
-                watcher,
-                actor,
-                reference,
-                reason: reason.clone(),
-            });
-        }
-    }
-
-    fn detach_links_and_propagate(
-        &mut self,
-        actor: ActorId,
-        reason: &ExitReason,
-        linked: Vec<ActorId>,
-    ) {
-        for linked_actor in linked {
-            if linked_actor == actor {
-                continue;
-            }
-
-            if let Some(other) = self.actor_state_mut(linked_actor) {
-                other.links.remove(&actor);
-            }
-
-            self.propagate_link_exit(
-                linked_actor,
-                ExitSignal {
-                    from: actor,
-                    reason: reason.clone(),
-                    linked: true,
-                },
-            );
-        }
-    }
-
-    fn propagate_link_exit(&mut self, target: ActorId, signal: ExitSignal) {
-        let Some((kill_now, trap_exit)) = self.actor_state_mut(target).map(|target_state| {
-            (
-                matches!(signal.reason, ExitReason::Kill)
-                    || (signal.linked
-                        && !target_state.trap_exit
-                        && !matches!(signal.reason, ExitReason::Normal)),
-                target_state.trap_exit,
-            )
-        }) else {
-            return;
-        };
-
-        if kill_now {
-            self.force_exit(target, signal.reason);
-            return;
-        }
-
-        if signal.linked && !trap_exit && matches!(signal.reason, ExitReason::Normal) {
-            return;
-        }
-
-        let _ = self.enqueue_runtime_envelope(target, Envelope::Exit(signal), "exit");
-    }
-
-    fn force_exit(&mut self, actor: ActorId, reason: ExitReason) -> bool {
-        let Some(entry) = self.take_actor(actor) else {
-            return false;
-        };
-
-        self.finish_actor(entry, reason);
-        true
-    }
-
     fn spawn_timer(&mut self, target: ActorId, token: TimerToken, delay: Duration) {
         let sender = self.event_tx.clone();
         let handle = self.tokio.spawn(async move {
@@ -1616,16 +1333,6 @@ impl LocalRuntime {
     }
 }
 
-fn normalize_config(mut config: SchedulerConfig) -> SchedulerConfig {
-    config.scheduler_count = 1;
-    config.max_actors = config.max_actors.max(1);
-    config.default_mailbox_capacity = config.default_mailbox_capacity.max(1);
-    config.mailbox_runtime_reserve = config
-        .mailbox_runtime_reserve
-        .min(config.default_mailbox_capacity.saturating_sub(1));
-    config
-}
-
 fn schedule_actor(run_queue: &mut VecDeque<ActorId>, state: &mut ActorState) {
     if let Some(actor_id) = mark_scheduled(state) {
         run_queue.push_back(actor_id);
@@ -1685,9 +1392,10 @@ mod tests {
     };
 
     use crate::{
-        Actor, ActorTurn, Context, Envelope, EventCursor, ExitReason, LifecycleEvent, LocalRuntime,
-        PoolKind, Ref, RegistryError, RuntimeEventKind, SchedulerConfig, SendError, SpawnError,
-        SpawnOptions, TimerToken, envelope::DownMessage,
+        Actor, ActorTurn, Context, Envelope, ExitReason, LifecycleEvent, LocalRuntime, PoolKind,
+        Ref, RegistryError, SchedulerConfig, SendError, SpawnError, SpawnOptions, TimerToken,
+        envelope::DownMessage,
+        observability::{EventCursor, RuntimeEventKind},
     };
 
     #[derive(Clone, PartialEq, Eq)]

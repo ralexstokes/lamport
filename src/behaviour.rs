@@ -1,3 +1,4 @@
+mod adapter;
 mod gen_server;
 mod gen_statem;
 
@@ -6,8 +7,7 @@ pub use gen_statem::{GenStatem, GenStatemActor, StatemCallOutcome, StatemOutcome
 
 use crate::{
     envelope::{
-        CallTimedOut, DownMessage, Envelope, ExitSignal, Payload, SystemMessage, TaskCompleted,
-        TimerFired,
+        CallTimedOut, DownMessage, ExitSignal, Payload, SystemMessage, TaskCompleted, TimerFired,
     },
     types::Ref,
 };
@@ -42,19 +42,6 @@ pub enum RuntimeInfo {
     Timer(TimerFired),
     /// Reserved runtime control message.
     System(SystemMessage),
-}
-
-fn envelope_to_runtime_info(envelope: Envelope) -> Option<RuntimeInfo> {
-    match envelope {
-        Envelope::Reply { reference, message } => Some(RuntimeInfo::Reply { reference, message }),
-        Envelope::Task(task) => Some(RuntimeInfo::Task(task)),
-        Envelope::CallTimeout(timeout) => Some(RuntimeInfo::CallTimeout(timeout)),
-        Envelope::Exit(signal) => Some(RuntimeInfo::Exit(signal)),
-        Envelope::Down(message) => Some(RuntimeInfo::Down(message)),
-        Envelope::Timer(timer) => Some(RuntimeInfo::Timer(timer)),
-        Envelope::System(message) => Some(RuntimeInfo::System(message)),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

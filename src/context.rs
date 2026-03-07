@@ -151,8 +151,8 @@ pub enum TimerError {
     UnknownTimer(TimerToken),
 }
 
-/// Runtime operations available to an actor while it is running.
-pub trait Context {
+/// Core runtime operations available to an actor while it is running.
+pub trait ActorContext {
     /// Returns the current actor id.
     fn actor_id(&self) -> ActorId;
 
@@ -163,45 +163,6 @@ pub trait Context {
 
     /// Spawns a new actor into the runtime.
     fn spawn<A: Actor>(&mut self, actor: A, options: SpawnOptions) -> Result<ActorId, SpawnError>;
-
-    /// Spawns a typed `GenServer` into the runtime.
-    fn spawn_gen_server<G>(
-        &mut self,
-        server: G,
-        options: SpawnOptions,
-    ) -> Result<ActorId, SpawnError>
-    where
-        G: GenServer,
-        G::Info: From<RuntimeInfo>,
-        G::State: Send,
-    {
-        self.spawn(GenServerActor::new(server), options)
-    }
-
-    /// Spawns a typed `GenStatem` into the runtime.
-    fn spawn_gen_statem<G>(
-        &mut self,
-        machine: G,
-        options: SpawnOptions,
-    ) -> Result<ActorId, SpawnError>
-    where
-        G: GenStatem,
-        G::Info: From<RuntimeInfo>,
-    {
-        self.spawn(GenStatemActor::new(machine), options)
-    }
-
-    /// Spawns a typed `Supervisor` into the runtime.
-    fn spawn_supervisor<S>(
-        &mut self,
-        supervisor: S,
-        options: SpawnOptions,
-    ) -> Result<ActorId, SpawnError>
-    where
-        S: Supervisor,
-    {
-        self.spawn(SupervisorActor::new(supervisor), options)
-    }
 
     /// Resolves a registered actor name through the runtime registry.
     fn whereis(&self, name: &str) -> Option<ActorId>;
@@ -215,11 +176,6 @@ pub trait Context {
     /// Sends an envelope directly to another actor.
     fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError>;
 
-    /// Sends a typed fire-and-forget message to another actor.
-    fn send<M: Message>(&mut self, to: ActorId, message: M) -> Result<(), SendError> {
-        self.send_envelope(to, Envelope::user(message))
-    }
-
     /// Sends a typed request and captures the reply reference and mailbox watermark.
     ///
     /// When `timeout` is set, the runtime delivers `Envelope::CallTimeout` with
@@ -230,11 +186,6 @@ pub trait Context {
         message: M,
         timeout: Option<Duration>,
     ) -> Result<PendingCall, SendError>;
-
-    /// Replies to a pending request.
-    fn reply<M: Message>(&mut self, token: ReplyToken, message: M) -> Result<(), SendError> {
-        self.send_envelope(token.from, Envelope::reply(token.reference, message))
-    }
 
     /// Creates a bidirectional failure relationship with another actor.
     fn link(&mut self, other: ActorId) -> Result<(), LinkError>;
@@ -281,6 +232,66 @@ pub trait Context {
     /// Exits the current actor with the given reason.
     fn exit(&mut self, reason: ExitReason);
 
+    /// Requests runtime-managed shutdown for another actor.
+    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError>;
+}
+
+/// Higher-level actor spawn and messaging helpers layered on top of [`ActorContext`].
+pub trait BehaviourContextExt: ActorContext {
+    /// Spawns a typed `GenServer` into the runtime.
+    fn spawn_gen_server<G>(
+        &mut self,
+        server: G,
+        options: SpawnOptions,
+    ) -> Result<ActorId, SpawnError>
+    where
+        G: GenServer,
+        G::Info: From<RuntimeInfo>,
+        G::State: Send,
+    {
+        self.spawn(GenServerActor::new(server), options)
+    }
+
+    /// Spawns a typed `GenStatem` into the runtime.
+    fn spawn_gen_statem<G>(
+        &mut self,
+        machine: G,
+        options: SpawnOptions,
+    ) -> Result<ActorId, SpawnError>
+    where
+        G: GenStatem,
+        G::Info: From<RuntimeInfo>,
+    {
+        self.spawn(GenStatemActor::new(machine), options)
+    }
+
+    /// Spawns a typed `Supervisor` into the runtime.
+    fn spawn_supervisor<S>(
+        &mut self,
+        supervisor: S,
+        options: SpawnOptions,
+    ) -> Result<ActorId, SpawnError>
+    where
+        S: Supervisor,
+    {
+        self.spawn(SupervisorActor::new(supervisor), options)
+    }
+
+    /// Sends a typed fire-and-forget message to another actor.
+    fn send<M: Message>(&mut self, to: ActorId, message: M) -> Result<(), SendError> {
+        self.send_envelope(to, Envelope::user(message))
+    }
+
+    /// Replies to a pending request.
+    fn reply<M: Message>(&mut self, token: ReplyToken, message: M) -> Result<(), SendError> {
+        self.send_envelope(token.from, Envelope::reply(token.reference, message))
+    }
+}
+
+impl<T: ActorContext + ?Sized> BehaviourContextExt for T {}
+
+/// Supervisor bookkeeping hooks layered on top of [`ActorContext`].
+pub trait SupervisorContext: ActorContext {
     /// Registers supervisor metadata for the current actor.
     fn configure_supervisor(&mut self, _flags: SupervisorFlags, _child_specs: Vec<ChildSpec>) {}
 
@@ -294,10 +305,18 @@ pub trait Context {
 
     /// Marks a supervisor child as exited in the current actor's runtime metadata.
     fn supervisor_child_exited(&mut self, _child_id: &'static str, _actor: ActorId) {}
+}
 
-    /// Requests runtime-managed shutdown for another actor.
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError>;
-
+/// Lifecycle event hooks layered on top of [`ActorContext`].
+pub trait LifecycleContext: ActorContext {
     /// Emits a structured lifecycle event into the runtime stream.
     fn emit_lifecycle_event(&mut self, _event: LifecycleEvent) {}
 }
+
+/// Full actor runtime interface used by [`crate::Actor`].
+pub trait Context:
+    ActorContext + BehaviourContextExt + SupervisorContext + LifecycleContext
+{
+}
+
+impl<T> Context for T where T: ActorContext + SupervisorContext + LifecycleContext {}

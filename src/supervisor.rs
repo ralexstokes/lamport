@@ -1,18 +1,22 @@
+mod child_context;
+mod state;
+
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     time::{Duration, Instant},
 };
 
 use crate::{
     actor::{Actor, ActorTurn},
-    context::{
-        Context, LinkError, MonitorError, PendingCall, SendError, SpawnError, SpawnOptions,
-        TaskHandle, TimerError,
-    },
+    context::Context,
     envelope::{Envelope, ExitSignal},
     lifecycle::LifecycleEvent,
-    registry::RegistryError,
-    types::{ActorId, ChildSpec, ExitReason, Ref, Shutdown, Strategy, SupervisorFlags, TimerToken},
+    types::{ActorId, ChildSpec, ExitReason, Shutdown, Strategy, SupervisorFlags},
+};
+
+use self::{
+    child_context::SupervisorChildContext,
+    state::{RestartPlan, ShutdownPlan, SupervisorAction, SupervisorActorState},
 };
 
 /// Failure to start a child from a supervisor.
@@ -68,42 +72,6 @@ pub struct SupervisorActor<S: Supervisor> {
     state: SupervisorActorState,
 }
 
-#[derive(Debug)]
-struct SupervisorActorState {
-    flags: SupervisorFlags,
-    specs: Vec<ChildSpec>,
-    running: BTreeMap<&'static str, ActorId>,
-    by_actor: BTreeMap<ActorId, &'static str>,
-    action: Option<SupervisorAction>,
-}
-
-#[derive(Debug)]
-enum SupervisorAction {
-    Restart(RestartPlan),
-    Shutdown(ShutdownPlan),
-}
-
-#[derive(Debug)]
-struct RestartPlan {
-    active_shutdown: Option<&'static str>,
-    shutdown_queue: VecDeque<&'static str>,
-    restart_queue: VecDeque<&'static str>,
-    old_children: BTreeMap<&'static str, Option<ActorId>>,
-}
-
-#[derive(Debug)]
-struct ShutdownPlan {
-    active_child: Option<&'static str>,
-    shutdown_queue: VecDeque<&'static str>,
-    final_reason: ExitReason,
-}
-
-struct SupervisorChildContext<'a, C> {
-    inner: &'a mut C,
-    child_id: &'static str,
-    spawned_actor: Option<ActorId>,
-}
-
 impl<S: Supervisor> SupervisorActor<S> {
     /// Wraps a typed supervisor as a low-level actor.
     pub fn new(supervisor: S) -> Self {
@@ -114,196 +82,6 @@ impl<S: Supervisor> SupervisorActor<S> {
             supervisor,
             state: SupervisorActorState::new(flags, specs),
         }
-    }
-}
-
-impl SupervisorActorState {
-    fn new(flags: SupervisorFlags, specs: Vec<ChildSpec>) -> Self {
-        Self {
-            flags,
-            specs,
-            running: BTreeMap::new(),
-            by_actor: BTreeMap::new(),
-            action: None,
-        }
-    }
-
-    fn spec(&self, child_id: &'static str) -> Option<&ChildSpec> {
-        self.specs.iter().find(|spec| spec.id == child_id)
-    }
-
-    fn running_actor(&self, child_id: &'static str) -> Option<ActorId> {
-        self.running.get(child_id).copied()
-    }
-
-    fn remember_child(&mut self, child_id: &'static str, actor: ActorId) {
-        self.running.insert(child_id, actor);
-        self.by_actor.insert(actor, child_id);
-    }
-
-    fn forget_child_actor(&mut self, actor: ActorId) -> Option<&'static str> {
-        let child_id = self.by_actor.remove(&actor)?;
-        self.running.remove(child_id);
-        Some(child_id)
-    }
-
-    fn ordered_child_ids(&self, requested: Vec<&'static str>) -> Vec<&'static str> {
-        self.specs
-            .iter()
-            .filter_map(|spec| requested.contains(&spec.id).then_some(spec.id))
-            .collect()
-    }
-
-    fn running_children_reverse(&self, child_ids: &[&'static str]) -> VecDeque<&'static str> {
-        self.specs
-            .iter()
-            .rev()
-            .filter_map(|spec| {
-                (child_ids.contains(&spec.id) && self.running.contains_key(spec.id))
-                    .then_some(spec.id)
-            })
-            .collect()
-    }
-
-    fn all_running_reverse(&self) -> VecDeque<&'static str> {
-        self.specs
-            .iter()
-            .rev()
-            .filter_map(|spec| self.running.contains_key(spec.id).then_some(spec.id))
-            .collect()
-    }
-}
-
-impl<'a, C> SupervisorChildContext<'a, C> {
-    fn new(inner: &'a mut C, child_id: &'static str) -> Self {
-        Self {
-            inner,
-            child_id,
-            spawned_actor: None,
-        }
-    }
-}
-
-impl<C: Context> Context for SupervisorChildContext<'_, C> {
-    fn actor_id(&self) -> ActorId {
-        self.inner.actor_id()
-    }
-
-    fn scheduler_id(&self) -> Option<usize> {
-        self.inner.scheduler_id()
-    }
-
-    fn spawn<A: Actor>(
-        &mut self,
-        actor: A,
-        mut options: SpawnOptions,
-    ) -> Result<ActorId, SpawnError> {
-        options.link_to_parent = true;
-        options.supervisor_child = Some(self.child_id);
-        let actor_id = self.inner.spawn(actor, options)?;
-        self.spawned_actor = Some(actor_id);
-        Ok(actor_id)
-    }
-
-    fn whereis(&self, name: &str) -> Option<ActorId> {
-        self.inner.whereis(name)
-    }
-
-    fn register_name(&mut self, name: String) -> Result<(), RegistryError> {
-        self.inner.register_name(name)
-    }
-
-    fn unregister_name(&mut self) -> Option<String> {
-        self.inner.unregister_name()
-    }
-
-    fn send_envelope(&mut self, to: ActorId, envelope: Envelope) -> Result<(), SendError> {
-        self.inner.send_envelope(to, envelope)
-    }
-
-    fn ask<M: crate::envelope::Message>(
-        &mut self,
-        to: ActorId,
-        message: M,
-        timeout: Option<Duration>,
-    ) -> Result<PendingCall, SendError> {
-        self.inner.ask(to, message, timeout)
-    }
-
-    fn link(&mut self, other: ActorId) -> Result<(), LinkError> {
-        self.inner.link(other)
-    }
-
-    fn unlink(&mut self, other: ActorId) -> Result<(), LinkError> {
-        self.inner.unlink(other)
-    }
-
-    fn monitor(&mut self, other: ActorId) -> Result<Ref, MonitorError> {
-        self.inner.monitor(other)
-    }
-
-    fn demonitor(&mut self, reference: Ref) -> Result<(), MonitorError> {
-        self.inner.demonitor(reference)
-    }
-
-    fn set_trap_exit(&mut self, enabled: bool) {
-        self.inner.set_trap_exit(enabled);
-    }
-
-    fn schedule_after(&mut self, delay: Duration, token: TimerToken) -> Result<(), TimerError> {
-        self.inner.schedule_after(delay, token)
-    }
-
-    fn cancel_timer(&mut self, token: TimerToken) -> bool {
-        self.inner.cancel_timer(token)
-    }
-
-    fn spawn_blocking_io<F, R>(&mut self, job: F) -> TaskHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.inner.spawn_blocking_io(job)
-    }
-
-    fn spawn_blocking_cpu<F, R>(&mut self, job: F) -> TaskHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.inner.spawn_blocking_cpu(job)
-    }
-
-    fn yield_now(&mut self) {
-        self.inner.yield_now();
-    }
-
-    fn exit(&mut self, reason: ExitReason) {
-        self.inner.exit(reason);
-    }
-
-    fn configure_supervisor(&mut self, flags: SupervisorFlags, child_specs: Vec<ChildSpec>) {
-        self.inner.configure_supervisor(flags, child_specs);
-    }
-
-    fn record_supervisor_restart(&mut self) -> bool {
-        self.inner.record_supervisor_restart()
-    }
-
-    fn supervisor_child_started(&mut self, child_id: &'static str, actor: ActorId) {
-        self.inner.supervisor_child_started(child_id, actor);
-    }
-
-    fn supervisor_child_exited(&mut self, child_id: &'static str, actor: ActorId) {
-        self.inner.supervisor_child_exited(child_id, actor);
-    }
-
-    fn shutdown_actor(&mut self, actor: ActorId, policy: Shutdown) -> Result<(), SendError> {
-        self.inner.shutdown_actor(actor, policy)
-    }
-
-    fn emit_lifecycle_event(&mut self, event: LifecycleEvent) {
-        self.inner.emit_lifecycle_event(event);
     }
 }
 
@@ -363,12 +141,8 @@ impl<S: Supervisor> SupervisorActor<S> {
         ctx.supervisor_child_exited(child_id, actor);
 
         match self.state.action.take() {
-            Some(SupervisorAction::Shutdown(mut plan)) => {
-                self.advance_shutdown(&mut plan, child_id, ctx)
-            }
-            Some(SupervisorAction::Restart(mut plan)) => {
-                self.advance_restart(&mut plan, child_id, ctx)
-            }
+            Some(SupervisorAction::Shutdown(plan)) => self.advance_shutdown(plan, child_id, ctx),
+            Some(SupervisorAction::Restart(plan)) => self.advance_restart(plan, child_id, ctx),
             None => {
                 let spec = self
                     .state
@@ -393,7 +167,7 @@ impl<S: Supervisor> SupervisorActor<S> {
         failed_child: Option<(&'static str, ActorId)>,
         ctx: &mut C,
     ) -> ActorTurn {
-        let child_ids = self.state.ordered_child_ids(requested_children);
+        let child_ids = self.state.ordered_child_ids(&requested_children);
         if child_ids.is_empty() {
             return ActorTurn::Continue;
         }
@@ -421,7 +195,7 @@ impl<S: Supervisor> SupervisorActor<S> {
             .collect();
 
         let active_shutdown = shutdown_queue.pop_front();
-        let mut plan = RestartPlan {
+        let plan = RestartPlan {
             active_shutdown,
             shutdown_queue,
             restart_queue: child_ids.iter().copied().collect(),
@@ -429,7 +203,7 @@ impl<S: Supervisor> SupervisorActor<S> {
         };
 
         if let Some(child_id) = plan.active_shutdown {
-            return self.request_restart_shutdown(&mut plan, child_id, ctx);
+            return self.request_restart_shutdown(plan, child_id, ctx);
         }
 
         self.finish_restart(plan, ctx)
@@ -437,19 +211,11 @@ impl<S: Supervisor> SupervisorActor<S> {
 
     fn advance_restart<C: Context>(
         &mut self,
-        plan: &mut RestartPlan,
+        mut plan: RestartPlan,
         child_id: &'static str,
         ctx: &mut C,
     ) -> ActorTurn {
-        if plan.active_shutdown == Some(child_id) {
-            plan.active_shutdown = None;
-        } else if let Some(index) = plan
-            .shutdown_queue
-            .iter()
-            .position(|queued| *queued == child_id)
-        {
-            plan.shutdown_queue.remove(index);
-        } else {
+        if plan.complete_shutdown(child_id).is_err() {
             return self.begin_shutdown(
                 ExitReason::Error(format!(
                     "child `{child_id}` exited while a restart was in progress"
@@ -458,24 +224,16 @@ impl<S: Supervisor> SupervisorActor<S> {
             );
         }
 
-        if let Some(next_child) = plan.shutdown_queue.pop_front() {
-            plan.active_shutdown = Some(next_child);
+        if let Some(next_child) = plan.next_shutdown() {
             return self.request_restart_shutdown(plan, next_child, ctx);
         }
-
-        let plan = RestartPlan {
-            active_shutdown: None,
-            shutdown_queue: std::mem::take(&mut plan.shutdown_queue),
-            restart_queue: std::mem::take(&mut plan.restart_queue),
-            old_children: std::mem::take(&mut plan.old_children),
-        };
 
         self.finish_restart(plan, ctx)
     }
 
     fn request_restart_shutdown<C: Context>(
         &mut self,
-        plan: &mut RestartPlan,
+        mut plan: RestartPlan,
         child_id: &'static str,
         ctx: &mut C,
     ) -> ActorTurn {
@@ -496,12 +254,7 @@ impl<S: Supervisor> SupervisorActor<S> {
             return self.advance_restart(plan, child_id, ctx);
         }
 
-        self.state.action = Some(SupervisorAction::Restart(RestartPlan {
-            active_shutdown: plan.active_shutdown,
-            shutdown_queue: plan.shutdown_queue.clone(),
-            restart_queue: plan.restart_queue.clone(),
-            old_children: plan.old_children.clone(),
-        }));
+        self.state.action = Some(SupervisorAction::Restart(plan));
 
         ActorTurn::Continue
     }
@@ -548,31 +301,14 @@ impl<S: Supervisor> SupervisorActor<S> {
 
     fn advance_shutdown<C: Context>(
         &mut self,
-        plan: &mut ShutdownPlan,
+        mut plan: ShutdownPlan,
         child_id: &'static str,
         ctx: &mut C,
     ) -> ActorTurn {
-        if plan.active_child == Some(child_id) {
-            plan.active_child = None;
-        } else if let Some(index) = plan
-            .shutdown_queue
-            .iter()
-            .position(|queued| *queued == child_id)
-        {
-            plan.shutdown_queue.remove(index);
-        }
+        plan.complete_child(child_id);
 
-        if let Some(next_child) = plan.shutdown_queue.pop_front() {
-            plan.active_child = Some(next_child);
-            return self.request_shutdown(
-                ShutdownPlan {
-                    active_child: plan.active_child,
-                    shutdown_queue: plan.shutdown_queue.clone(),
-                    final_reason: plan.final_reason.clone(),
-                },
-                next_child,
-                ctx,
-            );
+        if let Some(next_child) = plan.next_child() {
+            return self.request_shutdown(plan, next_child, ctx);
         }
 
         ActorTurn::Stop(plan.final_reason.clone())
@@ -587,7 +323,7 @@ impl<S: Supervisor> SupervisorActor<S> {
         let Some(actor) = self.state.running_actor(child_id) else {
             let mut plan = plan;
             plan.active_child = None;
-            return self.advance_shutdown(&mut plan, child_id, ctx);
+            return self.advance_shutdown(plan, child_id, ctx);
         };
 
         let spec = self
@@ -600,7 +336,7 @@ impl<S: Supervisor> SupervisorActor<S> {
             self.state.forget_child_actor(actor);
             let mut plan = plan;
             plan.active_child = None;
-            return self.advance_shutdown(&mut plan, child_id, ctx);
+            return self.advance_shutdown(plan, child_id, ctx);
         }
 
         self.state.action = Some(SupervisorAction::Shutdown(plan));
@@ -749,8 +485,9 @@ mod tests {
 
     use crate::{
         Actor, ActorTurn, Context, DownMessage, Envelope, ExitReason, LifecycleEvent, LocalRuntime,
-        SpawnOptions, SupervisorActor, TimerToken,
+        SpawnOptions, TimerToken,
         envelope::{SystemMessage, TimerFired},
+        supervisor::SupervisorActor,
         types::{ActorStatus, ChildSpec, Restart, Shutdown, Strategy, SupervisorFlags},
     };
 

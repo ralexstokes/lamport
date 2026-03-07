@@ -73,31 +73,7 @@ pub fn boot_concurrent_application<A: Application>(
     Ok((runtime, handle))
 }
 
-impl LocalRuntime {
-    /// Boots an application root supervisor into an existing local runtime.
-    pub fn boot_application<A: Application>(
-        &mut self,
-        application: A,
-    ) -> Result<ApplicationHandle, SpawnError> {
-        let (name, options, root_supervisor) = prepare_application(application);
-        let root = self.spawn_supervisor_with_options(root_supervisor, options)?;
-        Ok(ApplicationHandle::new(name, root))
-    }
-}
-
-impl ConcurrentRuntime {
-    /// Boots an application root supervisor into an existing concurrent runtime.
-    pub fn boot_application<A: Application>(
-        &self,
-        application: A,
-    ) -> Result<ApplicationHandle, SpawnError> {
-        let (name, options, root_supervisor) = prepare_application(application);
-        let root = self.spawn_supervisor_with_options(root_supervisor, options)?;
-        Ok(ApplicationHandle::new(name, root))
-    }
-}
-
-fn prepare_application<A: Application>(
+pub(crate) fn prepare_application<A: Application>(
     application: A,
 ) -> (&'static str, SpawnOptions, A::RootSupervisor) {
     let name = application.name();

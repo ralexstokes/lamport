@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
 use lamport::{
-    Actor, ActorId, ActorTreeNode, ActorTurn, Context, Envelope, EventCursor, ExitReason,
-    LifecycleEvent, LocalRuntime, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
+    Actor, ActorId, ActorTurn, Context, Envelope, ExitReason, LifecycleEvent, LocalRuntime,
     SpawnOptions,
+    observability::{
+        ActorTreeNode, EventCursor, RuntimeEvent, RuntimeEventKind, RuntimeIntrospection,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
