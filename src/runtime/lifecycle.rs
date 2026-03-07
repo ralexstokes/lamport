@@ -147,6 +147,10 @@ impl LocalRuntime {
             });
         }
 
+        entry.state.links.clear();
+        entry.state.monitors_in.clear();
+        entry.state.monitors_out.clear();
+        entry.state.suspended = false;
         entry.state.status = ActorStatus::Dead;
         entry.state.metrics.last_exit = Some(final_reason.clone());
         entry.state.metrics.mailbox_len = 0;

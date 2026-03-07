@@ -95,6 +95,10 @@ impl RuntimeShared {
                 );
             }
 
+            entry.links.clear();
+            entry.monitors_in.clear();
+            entry.monitors_out.clear();
+            entry.suspended = false;
             entry.status = ActorStatus::Dead;
             entry.metrics.last_exit = Some(final_reason.clone());
             entry.metrics.mailbox_len = 0;

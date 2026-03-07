@@ -20,7 +20,10 @@ use crate::{
         ControlError, ControlResult, LocalUpgradeError, LocalUpgradeFailure, LocalUpgradeReport,
         LocalUpgradeStage, StateSnapshot, TraceOptions,
     },
-    envelope::{DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted, TimerFired},
+    envelope::{
+        CallTimedOut, DownMessage, Envelope, ExitSignal, Message, ReplyToken, TaskCompleted,
+        TimerFired,
+    },
     internal::{
         ActorSlotAllocator, ExitDisposition, ShutdownMode, ShutdownTracker, SupervisorRuntimeState,
         TurnEffects, actor_mailbox, classify_exit_signal, mailbox_overflow_reason,
@@ -1888,12 +1891,36 @@ impl LocalRuntime {
     }
 
     fn cancel_call_timeout(&mut self, actor: ActorId, reference: Ref) -> bool {
-        let Some(handle) = self.call_timeout_tasks.remove(&(actor, reference)) else {
-            return false;
-        };
+        let mut cancelled = false;
+        if let Some(handle) = self.call_timeout_tasks.remove(&(actor, reference)) {
+            handle.abort();
+            cancelled = true;
+        }
 
-        handle.abort();
-        true
+        if let Some(entry) = self
+            .actors
+            .get_mut(&actor.local_id)
+            .and_then(|entry| (entry.state.id == actor).then_some(entry))
+        {
+            let removed = entry
+                .state
+                .mailbox
+                .remove_matching(|envelope| {
+                    matches!(
+                        envelope,
+                        Envelope::CallTimeout(CallTimedOut {
+                            reference: queued_reference,
+                        }) if *queued_reference == reference
+                    )
+                })
+                .is_some();
+            if removed {
+                entry.state.metrics.mailbox_len = entry.state.mailbox.len();
+            }
+            cancelled |= removed;
+        }
+
+        cancelled
     }
 
     fn cancel_all_call_timeouts(&mut self, actor: ActorId) {
@@ -2289,6 +2316,31 @@ mod tests {
 
         fn handle<C: Context>(&mut self, _envelope: Envelope, _ctx: &mut C) -> ActorTurn {
             ActorTurn::Continue
+        }
+    }
+
+    struct FinalizationActor {
+        peer: crate::ActorId,
+    }
+
+    impl Actor for FinalizationActor {
+        fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+            ctx.link(self.peer)
+                .map_err(|error| ExitReason::Error(format!("link failed: {error:?}")))?;
+            ctx.monitor(self.peer)
+                .map_err(|error| ExitReason::Error(format!("monitor failed: {error:?}")))?;
+            Ok(())
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            match envelope {
+                Envelope::User(payload)
+                    if payload.downcast_ref::<Control>() == Some(&Control::Crash) =>
+                {
+                    ActorTurn::Stop(ExitReason::Error("boom".into()))
+                }
+                _ => ActorTurn::Continue,
+            }
         }
     }
 
@@ -3001,6 +3053,74 @@ mod tests {
             runtime.send(actor, 2_u32),
             Err(SendError::MailboxFull { actor, capacity: 1 })
         );
+    }
+
+    #[test]
+    fn runtime_owned_delivery_overflow_forces_exit() {
+        let mut runtime = LocalRuntime::new(SchedulerConfig {
+            default_mailbox_capacity: 1,
+            mailbox_runtime_reserve: 0,
+            ..SchedulerConfig::default()
+        });
+        let actor = runtime.spawn(SinkActor).unwrap();
+
+        runtime.send(actor, 1_u32).unwrap();
+
+        assert!(runtime.enqueue_runtime_envelope(
+            actor,
+            Envelope::Timer(crate::envelope::TimerFired {
+                token: TimerToken::next(),
+            }),
+            "timer",
+        ));
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Dead);
+        assert_eq!(
+            snapshot.metrics.last_exit,
+            Some(super::mailbox_overflow_reason(actor, "timer"))
+        );
+    }
+
+    #[test]
+    fn cancel_call_timeout_withdraws_queued_timeout_envelope() {
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime.spawn(SinkActor).unwrap();
+        let reference = Ref::next();
+
+        let state = runtime.actor_state_mut(actor).unwrap();
+        super::push_envelope(state, Envelope::call_timeout(reference)).unwrap();
+        assert_eq!(state.mailbox.len(), 1);
+
+        assert!(runtime.cancel_call_timeout(actor, reference));
+
+        let state = runtime.actor_state_mut(actor).unwrap();
+        assert!(state.mailbox.is_empty());
+        assert_eq!(state.metrics.mailbox_len, 0);
+    }
+
+    #[test]
+    fn completed_snapshot_clears_links_and_monitors_after_exit() {
+        let mut runtime = LocalRuntime::default();
+        let peer = runtime.spawn(SinkActor).unwrap();
+        let target = runtime.spawn(FinalizationActor { peer }).unwrap();
+        runtime.spawn(LinkedActor { target }).unwrap();
+        runtime.spawn(MonitoringActor { target }).unwrap();
+        runtime.run_until_idle();
+
+        let live_snapshot = runtime.actor_snapshot(target).unwrap();
+        assert!(live_snapshot.links.contains(&peer));
+        assert_eq!(live_snapshot.monitors_in.len(), 1);
+        assert_eq!(live_snapshot.monitors_out.len(), 1);
+
+        runtime.send(target, Control::Crash).unwrap();
+        runtime.run_until_idle();
+
+        let dead_snapshot = runtime.actor_snapshot(target).unwrap();
+        assert_eq!(dead_snapshot.status, crate::ActorStatus::Dead);
+        assert!(dead_snapshot.links.is_empty());
+        assert!(dead_snapshot.monitors_in.is_empty());
+        assert!(dead_snapshot.monitors_out.is_empty());
     }
 
     #[test]
