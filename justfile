@@ -18,6 +18,12 @@ test:
 
 ci: fmt lint build test
 
+bench:
+    cargo bench --bench runtime_primitives
+
+bench-full:
+    cargo bench --bench runtime_primitives -- --full
+
 doc:
     cargo doc --workspace --no-deps --open
 
