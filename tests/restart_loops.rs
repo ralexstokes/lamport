@@ -47,7 +47,7 @@ impl TestSupervisor {
 
 impl Supervisor for TestSupervisor {
     fn flags(&self) -> SupervisorFlags {
-        self.flags.clone()
+        self.flags
     }
 
     fn child_specs(&self) -> &[ChildSpec] {

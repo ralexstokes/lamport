@@ -408,7 +408,7 @@ impl ServiceSupervisor {
 
 impl Supervisor for ServiceSupervisor {
     fn flags(&self) -> SupervisorFlags {
-        self.flags.clone()
+        self.flags
     }
 
     fn child_specs(&self) -> &[ChildSpec] {

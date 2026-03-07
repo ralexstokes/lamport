@@ -122,7 +122,7 @@ impl IntegrationSupervisor {
 
 impl Supervisor for IntegrationSupervisor {
     fn flags(&self) -> SupervisorFlags {
-        self.flags.clone()
+        self.flags
     }
 
     fn child_specs(&self) -> &[ChildSpec] {

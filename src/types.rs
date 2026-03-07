@@ -153,7 +153,7 @@ impl Default for Shutdown {
 }
 
 /// Supervisor-level restart intensity configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupervisorFlags {
     /// The restart strategy for the subtree.
     pub strategy: Strategy,
@@ -334,25 +334,24 @@ impl fmt::Display for CrashReport {
         }
 
         if !self.ancestor_contexts.is_empty() {
-            f.write_str("; ancestors: ")?;
-            for (index, ancestor) in self.ancestor_contexts.iter().enumerate() {
-                if index > 0 {
-                    f.write_str(" -> ")?;
-                }
-                write!(f, "{ancestor}")?;
-            }
+            write_ancestor_chain(f, &self.ancestor_contexts)?;
         } else if !self.ancestors.is_empty() {
-            f.write_str("; ancestors: ")?;
-            for (index, ancestor) in self.ancestors.iter().enumerate() {
-                if index > 0 {
-                    f.write_str(" -> ")?;
-                }
-                write!(f, "{ancestor}")?;
-            }
+            write_ancestor_chain(f, &self.ancestors)?;
         }
 
         Ok(())
     }
+}
+
+fn write_ancestor_chain(f: &mut fmt::Formatter<'_>, items: &[impl fmt::Display]) -> fmt::Result {
+    f.write_str("; ancestors: ")?;
+    for (index, ancestor) in items.iter().enumerate() {
+        if index > 0 {
+            f.write_str(" -> ")?;
+        }
+        write!(f, "{ancestor}")?;
+    }
+    Ok(())
 }
 
 /// Actor lifecycle state exposed through observability APIs.

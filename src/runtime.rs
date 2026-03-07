@@ -23,7 +23,7 @@ use crate::{
     },
     registry::{Registry, RegistryError},
     scheduler::{PoolKind, RunQueueSnapshot, SchedulerConfig, SchedulerMetrics},
-    supervisor::{RestartIntensity, Supervisor, SupervisorActor},
+    supervisor::{Supervisor, SupervisorActor},
     types::{
         ActorId, ActorMetrics, ActorStatus, ChildSpec, CrashReport, ExitReason, LifecycleEvent,
         Ref, Shutdown, ShutdownPhase, SupervisorFlags, TimerToken,
@@ -98,58 +98,10 @@ pub struct SupervisorSnapshot {
     pub active_restarts: usize,
 }
 
-#[derive(Debug, Clone)]
-struct SupervisorRuntimeState {
-    flags: SupervisorFlags,
-    child_specs: Vec<ChildSpec>,
-    running: BTreeMap<&'static str, ActorId>,
-    intensity: RestartIntensity,
-}
-
-impl SupervisorRuntimeState {
-    fn new(flags: SupervisorFlags, child_specs: Vec<ChildSpec>) -> Self {
-        Self {
-            flags: flags.clone(),
-            child_specs,
-            running: BTreeMap::new(),
-            intensity: RestartIntensity::new(flags),
-        }
-    }
-
-    fn set_running(&mut self, child_id: &'static str, actor: ActorId) {
-        self.running.insert(child_id, actor);
-    }
-
-    fn clear_running(&mut self, child_id: &'static str, actor: ActorId) {
-        if self.running.get(child_id).copied() == Some(actor) {
-            self.running.remove(child_id);
-        }
-    }
-
-    fn snapshot(&mut self, actor: ActorId) -> SupervisorSnapshot {
-        SupervisorSnapshot {
-            actor,
-            flags: self.flags.clone(),
-            children: self
-                .child_specs
-                .iter()
-                .cloned()
-                .map(|spec| SupervisorChildSnapshot {
-                    actor: self.running.get(spec.id).copied(),
-                    spec,
-                })
-                .collect(),
-            active_restarts: self.intensity.active_restarts(Instant::now()),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ShutdownTracker {
-    requester: ActorId,
-    policy: Shutdown,
-    task: Option<JoinHandle<()>>,
-}
+use crate::shared::{
+    ShutdownTracker, SupervisorRuntimeState, TurnEffects,
+    mailbox_overflow_reason, panic_reason,
+};
 
 #[derive(Debug)]
 struct ActorState {
@@ -269,12 +221,6 @@ impl ActorEntry {
     fn snapshot(&self) -> ActorSnapshot {
         self.state.snapshot(self.name)
     }
-}
-
-#[derive(Debug, Default)]
-struct TurnEffects {
-    exit_reason: Option<ExitReason>,
-    yielded: bool,
 }
 
 struct LocalContext<'a> {
@@ -917,7 +863,7 @@ impl LocalRuntime {
 
     /// Returns the current live actor tree.
     pub fn actor_tree(&self) -> ActorTree {
-        build_actor_tree(self.actor_snapshots())
+        build_actor_tree(&self.actor_snapshots())
     }
 
     /// Returns an aggregate metrics snapshot suitable for production monitoring.
@@ -1006,7 +952,7 @@ impl LocalRuntime {
 
     /// Returns aggregate runtime metrics.
     pub fn metrics(&self) -> SchedulerMetrics {
-        self.metrics.clone()
+        self.metrics
     }
 
     fn record_runtime_event(&mut self, kind: RuntimeEventKind) {
@@ -1272,8 +1218,9 @@ impl LocalRuntime {
                 self.return_actor(entry);
             }
             Err(panic) => {
+                let actor_id = entry.state.id;
                 let name = entry.name;
-                self.finish_actor(entry, panic_reason(name, panic));
+                self.finish_actor(entry, panic_reason(actor_id, name, panic));
             }
         }
     }
@@ -1311,8 +1258,9 @@ impl LocalRuntime {
             }
             Ok(Err(reason)) => self.finish_actor(entry, reason),
             Err(panic) => {
+                let actor_id = entry.state.id;
                 let name = entry.name;
-                self.finish_actor(entry, panic_reason(name, panic));
+                self.finish_actor(entry, panic_reason(actor_id, name, panic));
             }
         }
     }
@@ -1356,7 +1304,7 @@ impl LocalRuntime {
 
         let final_reason = match terminate_result {
             Ok(()) => reason,
-            Err(panic) => panic_reason(entry.name, panic),
+            Err(panic) => panic_reason(entry.state.id, entry.name, panic),
         };
 
         self.registry.unregister(entry.state.id);
@@ -1771,26 +1719,6 @@ fn park_actor(state: &mut ActorState) {
     state.metrics.scheduler_id = None;
     state.metrics.mailbox_len = state.mailbox.len();
     state.scheduled = false;
-}
-
-fn panic_reason(name: &'static str, payload: Box<dyn std::any::Any + Send>) -> ExitReason {
-    let detail = payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| {
-            payload
-                .downcast_ref::<&'static str>()
-                .map(|message| (*message).to_owned())
-        })
-        .unwrap_or_else(|| "unknown panic".to_owned());
-
-    ExitReason::Error(format!("actor `{name}` panicked: {detail}"))
-}
-
-fn mailbox_overflow_reason(actor: ActorId, label: &str) -> ExitReason {
-    ExitReason::Error(format!(
-        "actor `{actor:?}` mailbox overflow while delivering {label}"
-    ))
 }
 
 #[cfg(test)]

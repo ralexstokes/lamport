@@ -316,7 +316,7 @@ impl<S: Supervisor> Actor for SupervisorActor<S> {
 
     fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
         ctx.set_trap_exit(true);
-        ctx.configure_supervisor(self.state.flags.clone(), self.state.specs.clone());
+        ctx.configure_supervisor(self.state.flags, self.state.specs.clone());
 
         for spec in self.state.specs.clone() {
             if let Err(error) = self.start_child(spec.id, ctx) {
@@ -854,7 +854,7 @@ mod tests {
 
     impl Supervisor for TestSupervisor {
         fn flags(&self) -> SupervisorFlags {
-            self.flags.clone()
+            self.flags
         }
 
         fn child_specs(&self) -> &[ChildSpec] {
