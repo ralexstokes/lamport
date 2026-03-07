@@ -63,7 +63,7 @@ pub use context::{
 };
 pub use envelope::{
     CallTimedOut, DownMessage, Envelope, EnvelopeKind, ExitSignal, Message, Payload,
-    RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, TaskCompleted, TimerFired,
+    RECOMMENDED_INLINE_MESSAGE_LIMIT_BYTES, ReplyToken, SystemMessage, TaskCompleted, TimerFired,
 };
 pub use lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase};
 pub use registry::RegistryError;

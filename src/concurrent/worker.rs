@@ -12,7 +12,9 @@ use crate::{
     types::{ActorId, ActorStatus, ExitReason},
 };
 
-use super::{ActorCell, ConcurrentContext, RuntimeShared};
+use super::{
+    ActorCell, ConcurrentContext, RuntimeShared, apply_system_message_effects, take_next_envelope,
+};
 
 enum Either {
     Exit(ExitReason),
@@ -48,7 +50,8 @@ pub(super) async fn run_actor_task(
                 entry.metrics.scheduler_id = Some(entry.scheduler_id);
                 runtime.idle_cv.notify_all();
                 Either::Exit(reason)
-            } else if let Some(envelope) = entry.mailbox.pop_front() {
+            } else if let Some(envelope) = take_next_envelope(entry) {
+                apply_system_message_effects(entry, &envelope);
                 entry.metrics.mailbox_len = entry.mailbox.len();
                 entry.status = ActorStatus::Running;
                 entry.metrics.scheduler_id = Some(entry.scheduler_id);

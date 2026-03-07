@@ -66,6 +66,7 @@ struct ActorState {
     monitors_in: BTreeMap<Ref, ActorId>,
     monitors_out: BTreeMap<Ref, ActorId>,
     trap_exit: bool,
+    suspended: bool,
     status: ActorStatus,
     metrics: ActorMetrics,
     parent: Option<ActorId>,
@@ -86,6 +87,7 @@ impl ActorState {
             monitors_in: BTreeMap::new(),
             monitors_out: BTreeMap::new(),
             trap_exit: options.trap_exit,
+            suspended: false,
             status: ActorStatus::Starting,
             metrics: ActorMetrics::default(),
             parent: options.parent,
@@ -117,6 +119,7 @@ impl ActorState {
                 .map(|(reference, actor)| (*reference, *actor))
                 .collect(),
             trap_exit: self.trap_exit,
+            suspended: self.suspended,
             status: self.status,
             metrics: self.metrics.clone(),
         }
@@ -710,6 +713,25 @@ impl LocalRuntime {
         self.enqueue_actor_envelope(to, envelope)
     }
 
+    /// Sends a reserved runtime control message from outside the runtime.
+    pub fn send_system(
+        &mut self,
+        to: ActorId,
+        message: crate::envelope::SystemMessage,
+    ) -> Result<(), SendError> {
+        self.send_envelope(to, Envelope::System(message))
+    }
+
+    /// Suspends normal user-envelope execution for the actor.
+    pub fn suspend_actor(&mut self, actor: ActorId) -> Result<(), SendError> {
+        self.send_system(actor, crate::envelope::SystemMessage::Suspend)
+    }
+
+    /// Resumes normal user-envelope execution for the actor.
+    pub fn resume_actor(&mut self, actor: ActorId) -> Result<(), SendError> {
+        self.send_system(actor, crate::envelope::SystemMessage::Resume)
+    }
+
     /// Forces an actor to exit immediately.
     pub fn exit_actor(&mut self, actor: ActorId, reason: ExitReason) -> bool {
         self.force_exit(actor, reason)
@@ -1104,11 +1126,13 @@ impl LocalRuntime {
             return;
         }
 
-        let Some(envelope) = entry.state.mailbox.pop_front() else {
+        let Some(envelope) = take_next_envelope(&mut entry.state) else {
             park_actor(&mut entry.state);
             self.actors.insert(entry.state.id.local_id, entry);
             return;
         };
+
+        apply_system_message_effects(&mut entry.state, &envelope);
 
         entry.state.metrics.mailbox_len = entry.state.mailbox.len();
         entry.state.status = ActorStatus::Running;
@@ -1334,6 +1358,36 @@ fn push_envelope(state: &mut ActorState, envelope: Envelope) -> Result<Option<Ac
     })
 }
 
+fn take_next_envelope(state: &mut ActorState) -> Option<Envelope> {
+    if state.suspended {
+        return state
+            .mailbox
+            .selective_receive(Envelope::can_run_while_suspended);
+    }
+
+    state
+        .mailbox
+        .selective_receive(Envelope::is_system_message)
+        .or_else(|| state.mailbox.pop_front())
+}
+
+fn apply_system_message_effects(state: &mut ActorState, envelope: &Envelope) {
+    let Envelope::System(message) = envelope else {
+        return;
+    };
+
+    match message {
+        crate::envelope::SystemMessage::Suspend => state.suspended = true,
+        crate::envelope::SystemMessage::Resume => state.suspended = false,
+        crate::envelope::SystemMessage::GetState
+        | crate::envelope::SystemMessage::ReplaceState(_)
+        | crate::envelope::SystemMessage::TraceOn
+        | crate::envelope::SystemMessage::TraceOff
+        | crate::envelope::SystemMessage::Shutdown
+        | crate::envelope::SystemMessage::CodeChange => {}
+    }
+}
+
 fn mark_scheduled(state: &mut ActorState) -> Option<ActorId> {
     if state.scheduled || matches!(state.status, ActorStatus::Dead | ActorStatus::Exiting) {
         return None;
@@ -1367,8 +1421,9 @@ mod tests {
 
     use crate::{
         Actor, ActorTurn, Context, Envelope, ExitReason, LifecycleEvent, LocalRuntime, PoolKind,
-        Ref, RegistryError, SchedulerConfig, SendError, SpawnError, SpawnOptions, TimerToken,
-        envelope::DownMessage,
+        Ref, RegistryError, SchedulerConfig, SendError, SpawnError, SpawnOptions, SystemMessage,
+        TimerToken,
+        envelope::{DownMessage, ExitSignal},
         observability::{EventCursor, RuntimeEventKind},
     };
 
@@ -1602,6 +1657,27 @@ mod tests {
         }
     }
 
+    struct SuspendAwareActor {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Actor for SuspendAwareActor {
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            let label = match envelope {
+                Envelope::User(payload) => {
+                    format!("user:{}", payload.downcast::<u32>().ok().unwrap())
+                }
+                Envelope::System(SystemMessage::Suspend) => "system:suspend".into(),
+                Envelope::System(SystemMessage::Resume) => "system:resume".into(),
+                Envelope::Exit(ExitSignal { reason, .. }) => format!("exit:{reason}"),
+                Envelope::Down(DownMessage { reason, .. }) => format!("down:{reason}"),
+                other => panic!("unexpected envelope: {other:?}"),
+            };
+            self.seen.lock().unwrap().push(label);
+            ActorTurn::Continue
+        }
+    }
+
     #[test]
     fn linked_exit_kills_non_trapping_actor() {
         let mut runtime = LocalRuntime::default();
@@ -1715,6 +1791,110 @@ mod tests {
 
         assert!(done.load(Ordering::SeqCst));
         assert_eq!(runtime.metrics().blocking_cpu_jobs, 1);
+    }
+
+    #[test]
+    fn suspend_prioritizes_system_messages_and_resume_releases_user_mail() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn(SuspendAwareActor {
+                seen: Arc::clone(&seen),
+            })
+            .unwrap();
+
+        runtime.send(actor, 1_u32).unwrap();
+        runtime.suspend_actor(actor).unwrap();
+        runtime.send(actor, 2_u32).unwrap();
+        runtime.run_until_idle();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["system:suspend"]);
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.metrics.mailbox_len, 2);
+
+        runtime.resume_actor(actor).unwrap();
+        runtime.run_until_idle();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["system:suspend", "system:resume", "user:1", "user:2"]
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert!(!snapshot.suspended);
+        assert_eq!(snapshot.metrics.mailbox_len, 0);
+    }
+
+    #[test]
+    fn suspended_actor_still_receives_exit_signals() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn_with_options(
+                SuspendAwareActor {
+                    seen: Arc::clone(&seen),
+                },
+                SpawnOptions {
+                    trap_exit: true,
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+
+        runtime.suspend_actor(actor).unwrap();
+        runtime
+            .send_envelope(
+                actor,
+                Envelope::Exit(ExitSignal {
+                    from: actor,
+                    reason: ExitReason::Shutdown,
+                    linked: true,
+                }),
+            )
+            .unwrap();
+        runtime.send(actor, 7_u32).unwrap();
+        runtime.run_until_idle();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["system:suspend", "exit:shutdown"]
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.metrics.mailbox_len, 1);
+    }
+
+    #[test]
+    fn suspended_actor_still_receives_down_notifications() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn(SuspendAwareActor {
+                seen: Arc::clone(&seen),
+            })
+            .unwrap();
+
+        runtime.suspend_actor(actor).unwrap();
+        runtime
+            .send_envelope(
+                actor,
+                Envelope::Down(DownMessage {
+                    reference: Ref::new(99),
+                    actor: crate::ActorId::new(77, 0),
+                    reason: ExitReason::Shutdown,
+                }),
+            )
+            .unwrap();
+        runtime.send(actor, 9_u32).unwrap();
+        runtime.run_until_idle();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["system:suspend", "down:shutdown"]
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.metrics.mailbox_len, 1);
     }
 
     #[test]

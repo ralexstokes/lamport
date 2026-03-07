@@ -150,8 +150,9 @@ fn timer_throughput_bench(timer_count: usize) -> Duration {
 }
 
 fn main() {
-    let quick = std::env::args().any(|arg| arg == "--quick")
-        || std::env::var_os("LAMPORT_BENCH_QUICK").is_some();
+    let full = std::env::args().any(|arg| arg == "--full")
+        || std::env::var_os("LAMPORT_BENCH_FULL").is_some();
+    let quick = !full;
 
     let actor_spawns = if quick { 5_000 } else { 50_000 };
     let sends = if quick { 20_000 } else { 200_000 };

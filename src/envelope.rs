@@ -266,6 +266,14 @@ impl Envelope {
             Self::System(_) => EnvelopeKind::System,
         }
     }
+
+    pub(crate) const fn is_system_message(&self) -> bool {
+        matches!(self, Self::System(_))
+    }
+
+    pub(crate) const fn can_run_while_suspended(&self) -> bool {
+        matches!(self, Self::System(_) | Self::Exit(_) | Self::Down(_))
+    }
 }
 
 #[cfg(test)]

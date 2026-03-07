@@ -21,6 +21,8 @@ pub struct ActorSnapshot {
     pub monitors_out: Vec<(Ref, ActorId)>,
     /// Whether linked exits are trapped into the mailbox.
     pub trap_exit: bool,
+    /// Whether user-envelope execution is currently suspended.
+    pub suspended: bool,
     /// Current lifecycle status.
     pub status: ActorStatus,
     /// Runtime metrics for the actor.
