@@ -862,6 +862,18 @@ Blocking wait semantics:
 Voluntary yield in this profile MAY be ignored as a scheduling primitive. The
 reference implementation does so.
 
+The local profile MUST support quiescing a live supervisor tree, running
+`CodeChange` hooks in leaf-to-root order, and resuming the tree afterward.
+
+If a local supervisor-tree upgrade fails after one or more actors already
+completed `CodeChange`:
+
+- the runtime MUST attempt to resume every actor suspended by the transaction
+- actors whose `CodeChange` already succeeded MUST remain at the requested
+  target version
+- the runtime MUST surface which actors were already upgraded as part of the
+  failure result
+
 ### 14.3 Concurrent Multi-Scheduler Profile
 
 The concurrent profile MUST normalize configuration so that:

@@ -76,11 +76,16 @@ The repo also provides the pieces needed to operate and inspect a runtime:
 - retained lifecycle events and crash reports
 - incremental event consumption with `EventCursor`
 - Prometheus text export through `export_metrics_prometheus`
+- local supervisor-tree and application upgrade transactions in `LocalRuntime`
 - registered names via the runtime registry, resolved as local process
   addresses
 
 The [`examples/observability.rs`](../../examples/observability.rs) example is
 the best compact tour of these APIs.
+
+`LocalRuntime` upgrades are resume-only on failure: the runtime resumes the
+quiesced tree before returning an error, but it does not roll back actors whose
+`CodeChange` hook already succeeded.
 
 ## Example Coverage
 
@@ -94,6 +99,9 @@ The repository examples map closely to the main building blocks:
   flags, child specs, restarts, monitors, and application boot
 - [`examples/observability.rs`](../../examples/observability.rs): snapshots,
   events, crash reports, and metrics
+- [`examples/local_upgrade.rs`](../../examples/local_upgrade.rs): local
+  supervisor-tree quiescing, leaf-to-root `CodeChange`, and queued-message
+  delivery after resume
 - [`examples/runtime_comparison.rs`](../../examples/runtime_comparison.rs):
   when `ConcurrentRuntime` helps over `LocalRuntime`
 - [`examples/multi_llm_agents.rs`](../../examples/multi_llm_agents.rs):
@@ -104,7 +112,7 @@ The repository examples map closely to the main building blocks:
 The current repo is deliberately scoped. It does not yet provide:
 
 - distributed node-to-node messaging
-- hot code upgrade workflows
+- concurrent-runtime parity for supervisor-tree/application upgrades
 - priority mailboxes
 - durable or journaled mailboxes
 

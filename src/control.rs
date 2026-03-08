@@ -178,6 +178,11 @@ pub enum LocalUpgradeFailure {
 }
 
 /// Successful local supervisor-tree upgrade details.
+///
+/// Local supervisor-tree upgrades are atomic only with respect to quiescing and
+/// resuming normal message processing. Once an actor's `CodeChange` hook
+/// succeeds, that actor stays on the requested version for the rest of the
+/// transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalUpgradeReport {
     /// Root supervisor that scoped the upgrade.
@@ -191,6 +196,10 @@ pub struct LocalUpgradeReport {
 }
 
 /// Structured failure returned by a local supervisor-tree upgrade transaction.
+///
+/// `LocalRuntime` v0 uses resume-only failure semantics: it best-effort resumes
+/// every actor suspended by the transaction before returning this error, but it
+/// does not roll back actors listed in [`Self::upgraded`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalUpgradeError {
     /// Root supervisor that scoped the upgrade.
@@ -204,8 +213,13 @@ pub struct LocalUpgradeError {
     /// Concrete reason the transaction aborted.
     pub failure: Box<LocalUpgradeFailure>,
     /// Actors newly suspended by this transaction before it failed.
+    ///
+    /// The runtime attempts to resume these actors before returning the error.
     pub suspended: Vec<ActorId>,
     /// Actors whose `CodeChange` hook completed before the failure.
+    ///
+    /// These actors remain at `target_version`; partial local upgrades are not
+    /// rolled back automatically.
     pub upgraded: Vec<ActorId>,
 }
 

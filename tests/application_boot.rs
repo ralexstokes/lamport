@@ -395,11 +395,16 @@ struct UpgradeBranchSupervisor {
     specs: Vec<ChildSpec>,
     order: Arc<Mutex<Vec<&'static str>>>,
     reject_worker_upgrade: bool,
+    reject_branch_upgrade: bool,
     version: u64,
 }
 
 impl UpgradeBranchSupervisor {
-    fn new(order: Arc<Mutex<Vec<&'static str>>>, reject_worker_upgrade: bool) -> Self {
+    fn new(
+        order: Arc<Mutex<Vec<&'static str>>>,
+        reject_worker_upgrade: bool,
+        reject_branch_upgrade: bool,
+    ) -> Self {
         Self {
             flags: SupervisorFlags {
                 strategy: Strategy::OneForOne,
@@ -413,6 +418,7 @@ impl UpgradeBranchSupervisor {
             }],
             order,
             reject_worker_upgrade,
+            reject_branch_upgrade,
             version: 0,
         }
     }
@@ -471,6 +477,13 @@ impl Supervisor for UpgradeBranchSupervisor {
         _ctx: &mut C,
     ) -> Result<(), ControlError> {
         self.order.lock().unwrap().push("branch-supervisor");
+        if self.reject_branch_upgrade {
+            return Err(ControlError::rejected(
+                "CodeChange",
+                "branch supervisor rejected the upgrade",
+            ));
+        }
+
         match (from_version, to_version) {
             (current, requested) if current == requested => Ok(()),
             (0, 1) => {
@@ -487,11 +500,16 @@ struct UpgradeRootSupervisor {
     specs: Vec<ChildSpec>,
     order: Arc<Mutex<Vec<&'static str>>>,
     reject_worker_upgrade: bool,
+    reject_branch_upgrade: bool,
     version: u64,
 }
 
 impl UpgradeRootSupervisor {
-    fn new(order: Arc<Mutex<Vec<&'static str>>>, reject_worker_upgrade: bool) -> Self {
+    fn new(
+        order: Arc<Mutex<Vec<&'static str>>>,
+        reject_worker_upgrade: bool,
+        reject_branch_upgrade: bool,
+    ) -> Self {
         Self {
             flags: SupervisorFlags {
                 strategy: Strategy::OneForOne,
@@ -505,6 +523,7 @@ impl UpgradeRootSupervisor {
             }],
             order,
             reject_worker_upgrade,
+            reject_branch_upgrade,
             version: 0,
         }
     }
@@ -534,6 +553,7 @@ impl Supervisor for UpgradeRootSupervisor {
                     UpgradeBranchSupervisor::new(
                         Arc::clone(&self.order),
                         self.reject_worker_upgrade,
+                        self.reject_branch_upgrade,
                     ),
                     SpawnOptions::default(),
                 )
@@ -577,6 +597,7 @@ impl Supervisor for UpgradeRootSupervisor {
 struct UpgradeApplication {
     order: Arc<Mutex<Vec<&'static str>>>,
     reject_worker_upgrade: bool,
+    reject_branch_upgrade: bool,
 }
 
 impl Application for UpgradeApplication {
@@ -587,7 +608,11 @@ impl Application for UpgradeApplication {
     }
 
     fn root_supervisor(self) -> Self::RootSupervisor {
-        UpgradeRootSupervisor::new(self.order, self.reject_worker_upgrade)
+        UpgradeRootSupervisor::new(
+            self.order,
+            self.reject_worker_upgrade,
+            self.reject_branch_upgrade,
+        )
     }
 }
 
@@ -598,6 +623,7 @@ fn application_upgrade_quiesces_tree_and_runs_children_before_parents() {
         UpgradeApplication {
             order: Arc::clone(&order),
             reject_worker_upgrade: false,
+            reject_branch_upgrade: false,
         },
         Default::default(),
     )
@@ -633,6 +659,7 @@ fn application_upgrade_failure_resumes_tree_after_rejected_child_change() {
         UpgradeApplication {
             order: Arc::clone(&order),
             reject_worker_upgrade: true,
+            reject_branch_upgrade: false,
         },
         Default::default(),
     )
@@ -665,4 +692,58 @@ fn application_upgrade_failure_resumes_tree_after_rejected_child_change() {
     assert_eq!(snapshot.version, 0);
     assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 2);
     assert_eq!(order.lock().unwrap().as_slice(), &["worker"]);
+}
+
+#[test]
+fn application_upgrade_failure_keeps_prior_code_changes_and_resumes_tree() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (mut runtime, handle) = boot_local_application(
+        UpgradeApplication {
+            order: Arc::clone(&order),
+            reject_worker_upgrade: false,
+            reject_branch_upgrade: true,
+        },
+        Default::default(),
+    )
+    .expect("application should boot");
+
+    runtime.run_until_idle();
+
+    let root = handle.root_supervisor();
+    let branch = supervisor_child_actor(&mut runtime, root, UPGRADE_BRANCH_CHILD);
+    let worker = supervisor_child_actor(&mut runtime, branch, UPGRADE_WORKER_CHILD);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(1)))
+        .expect("queued cast should deliver");
+
+    let error = runtime.upgrade_application(handle, 1).unwrap_err();
+    assert_eq!(error.actor, Some(branch));
+    assert_eq!(error.stage, Some(LocalUpgradeStage::CodeChange));
+    assert_eq!(error.suspended, vec![root, branch, worker]);
+    assert_eq!(error.upgraded, vec![worker]);
+    assert!(matches!(
+        error.failure.as_ref(),
+        LocalUpgradeFailure::Control(ControlError::Rejected {
+            operation: "CodeChange",
+            reason,
+        }) if reason == "branch supervisor rejected the upgrade"
+    ));
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 11);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(2)))
+        .expect("post-failure cast should queue");
+    runtime.run_until_idle();
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 13);
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &["worker", "branch-supervisor"]
+    );
 }

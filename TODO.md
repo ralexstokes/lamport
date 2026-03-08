@@ -77,11 +77,12 @@ and code change.
     coordinated subtree shutdown, and typed behaviors still see shutdown via
     their `info` path.
 
-- [ ] Decide and document partial-upgrade failure semantics.
-  - The local upgrade path resumes the tree after failure, but it does not
-    currently roll back actors whose `CodeChange` already succeeded.
-  - Choose whether v0 means resume-only, rollback, or subtree restart after a
-    rejected/crashed upgrade step.
+- [x] Decide and document partial-upgrade failure semantics.
+  - v0 local upgrades are resume-only on failure: the runtime best-effort
+    resumes the quiesced tree before returning an error.
+  - Actors whose `CodeChange` already succeeded stay on the target version;
+    partial progress is surfaced through `LocalUpgradeError::upgraded` and is
+    not rolled back automatically.
 
 - [ ] Decide whether v0 requires concurrent upgrade parity.
   - `ConcurrentRuntime` supports actor-level control operations, but it does not

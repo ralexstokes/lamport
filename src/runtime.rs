@@ -958,6 +958,11 @@ impl LocalRuntime {
     }
 
     /// Quiesces a live supervisor tree, upgrades leaves before parents, and resumes it.
+    ///
+    /// If a later `CodeChange` step fails, the runtime makes a best-effort
+    /// attempt to resume the full tree before returning the error. Actors whose
+    /// code change already succeeded are left on `target_version`; local
+    /// supervisor-tree upgrades do not roll back partial progress.
     pub fn upgrade_supervisor_tree(
         &mut self,
         root: ActorId,
