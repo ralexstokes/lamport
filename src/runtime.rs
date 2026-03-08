@@ -141,6 +141,7 @@ trait ActorCell: Send {
     fn init(&mut self, ctx: &mut LocalContext<'_>) -> Result<(), ExitReason>;
     fn select_envelope(&mut self, ctx: &mut LocalContext<'_>) -> Option<ReceivedEnvelope>;
     fn handle(&mut self, envelope: Envelope, ctx: &mut LocalContext<'_>) -> ActorTurn;
+    fn shutdown(&mut self, ctx: &mut LocalContext<'_>) -> ActorTurn;
     fn state_version(&self) -> u64;
     fn inspect_state(&mut self, ctx: &mut LocalContext<'_>) -> Result<StateSnapshot, ControlError>;
     fn replace_state(
@@ -167,6 +168,10 @@ impl<A: Actor> ActorCell for A {
 
     fn handle(&mut self, envelope: Envelope, ctx: &mut LocalContext<'_>) -> ActorTurn {
         Actor::handle(self, envelope, ctx)
+    }
+
+    fn shutdown(&mut self, ctx: &mut LocalContext<'_>) -> ActorTurn {
+        Actor::shutdown(self, ctx)
     }
 
     fn state_version(&self) -> u64 {
@@ -2038,6 +2043,9 @@ fn handle_reserved_system_message(
             let _ = reply.send(result);
             ReservedSystemResult::Handled(ActorTurn::Continue)
         }
+        crate::envelope::SystemMessage::Shutdown => {
+            ReservedSystemResult::Handled(actor.shutdown(ctx))
+        }
         other => ReservedSystemResult::Forward(other),
     }
 }
@@ -2218,9 +2226,11 @@ mod tests {
     };
 
     use crate::{
-        Actor, ActorTurn, Context, ControlError, Envelope, ExitReason, LifecycleEvent,
-        LocalRuntime, PoolKind, ReceivedEnvelope, Ref, RegistryError, SchedulerConfig, SendError,
-        Shutdown, SpawnError, SpawnOptions, StateSnapshot, SystemMessage, TimerToken, TraceOptions,
+        Actor, ActorTurn, CallOutcome, Context, ControlError, Envelope, ExitReason, GenServer,
+        LifecycleEvent, LocalRuntime, PoolKind, ReceivedEnvelope, Ref, RegistryError, ReplyToken,
+        SchedulerConfig, SendError, ServerOutcome, Shutdown, SpawnError, SpawnOptions,
+        StateSnapshot, SystemMessage, TimerToken, TraceOptions,
+        behaviour::{GenServerActor, RuntimeInfo},
         envelope::{DownMessage, ExitSignal},
         observability::{EventCursor, RuntimeEventKind, TraceEventKind},
     };
@@ -2725,6 +2735,71 @@ mod tests {
                     Ok(())
                 }
                 (current, requested) => Err(ControlError::VersionMismatch { current, requested }),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum ShutdownInfo {
+        Shutdown,
+        Other,
+    }
+
+    impl From<RuntimeInfo> for ShutdownInfo {
+        fn from(info: RuntimeInfo) -> Self {
+            match info {
+                RuntimeInfo::System(SystemMessage::Shutdown) => Self::Shutdown,
+                _ => Self::Other,
+            }
+        }
+    }
+
+    struct ShutdownAwareServer {
+        seen_shutdown: Arc<AtomicBool>,
+    }
+
+    impl GenServer for ShutdownAwareServer {
+        type State = ();
+        type Call = ();
+        type Cast = ();
+        type Reply = ();
+        type Info = ShutdownInfo;
+
+        fn init<C: Context>(&mut self, _ctx: &mut C) -> Result<Self::State, ExitReason> {
+            Ok(())
+        }
+
+        fn handle_call<C: Context>(
+            &mut self,
+            _state: &mut Self::State,
+            _from: ReplyToken,
+            _message: Self::Call,
+            _ctx: &mut C,
+        ) -> CallOutcome<Self::Reply> {
+            CallOutcome::Reply(())
+        }
+
+        fn handle_cast<C: Context>(
+            &mut self,
+            _state: &mut Self::State,
+            _message: Self::Cast,
+            _ctx: &mut C,
+        ) -> ServerOutcome {
+            ServerOutcome::Continue
+        }
+
+        fn handle_info<C: Context>(
+            &mut self,
+            _state: &mut Self::State,
+            message: Self::Info,
+            _ctx: &mut C,
+        ) -> ServerOutcome {
+            match message {
+                ShutdownInfo::Shutdown => {
+                    self.seen_shutdown.store(true, Ordering::SeqCst);
+                    ServerOutcome::Stop(ExitReason::Shutdown)
+                }
+                ShutdownInfo::Other => ServerOutcome::Continue,
             }
         }
     }
@@ -3480,5 +3555,37 @@ mod tests {
             runtime.actor_snapshot(actor).unwrap().status,
             crate::ActorStatus::Dead
         );
+    }
+
+    #[test]
+    fn system_shutdown_stops_plain_actors() {
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime.spawn(CrashActor).unwrap();
+
+        runtime.send_system(actor, SystemMessage::Shutdown).unwrap();
+        runtime.run_until_idle();
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Shutdown));
+    }
+
+    #[test]
+    fn system_shutdown_reaches_genserver_info_path() {
+        let seen_shutdown = Arc::new(AtomicBool::new(false));
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn(GenServerActor::new(ShutdownAwareServer {
+                seen_shutdown: Arc::clone(&seen_shutdown),
+            }))
+            .unwrap();
+
+        runtime.send_system(actor, SystemMessage::Shutdown).unwrap();
+        runtime.run_until_idle();
+
+        assert!(seen_shutdown.load(Ordering::SeqCst));
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Shutdown));
     }
 }

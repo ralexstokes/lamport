@@ -71,11 +71,12 @@ and code change.
   - State migration needs versioning so code upgrades can reject incompatible
     state cleanly.
 
-- Tighten shutdown semantics.
-  - System-initiated shutdown should share one implementation path with
-    supervisor and external shutdown requests.
-  - Define what is guaranteed to run during orderly stop: terminate hooks,
-    mailbox draining, final reports, and monitor/link notifications.
+- [x] Unify the shutdown story completely.
+  - `shutdown_actor` and reserved `SystemMessage::Shutdown` now converge on the
+    same control-plane shutdown path.
+  - Raw actors stop with `ExitReason::Shutdown` by default, supervisors run
+    coordinated subtree shutdown, and typed behaviors still see shutdown via
+    their `info` path.
 
 - Add a real local upgrade workflow.
   - `CodeChange` is only the actor-local hook; the runtime still needs an

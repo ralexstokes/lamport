@@ -308,7 +308,7 @@ Current required behavior:
 
 - the mailbox reserve rules MUST treat system messages as runtime-originated
   control messages
-- supervisors MUST interpret `Shutdown`
+- every actor kind MUST interpret `Shutdown`
 - typed behaviors MUST surface system messages to their `info` path
 - the remaining system messages are reserved for future expansion and need not
   have built-in semantics yet

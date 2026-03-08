@@ -2,7 +2,7 @@ use crate::{
     actor::{Actor, ActorTurn},
     context::Context,
     control::{ControlError, StateSnapshot},
-    envelope::{Envelope, Message, Payload, ReplyToken},
+    envelope::{Envelope, Message, Payload, ReplyToken, SystemMessage},
     types::ExitReason,
 };
 
@@ -290,6 +290,10 @@ where
             DispatchEnvelope::User(payload) => self.handle_user(payload, ctx),
             DispatchEnvelope::Runtime(info) => self.handle_runtime_info(info, ctx),
         }
+    }
+
+    fn shutdown<C: Context>(&mut self, ctx: &mut C) -> ActorTurn {
+        self.handle_runtime_info(RuntimeInfo::System(SystemMessage::Shutdown), ctx)
     }
 
     fn terminate<C: Context>(&mut self, reason: ExitReason, ctx: &mut C) {

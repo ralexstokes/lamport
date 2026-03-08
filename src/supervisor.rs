@@ -133,11 +133,12 @@ impl<S: Supervisor> Actor for SupervisorActor<S> {
     fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
         match envelope {
             Envelope::Exit(signal) => self.handle_exit(signal, ctx),
-            Envelope::System(crate::envelope::SystemMessage::Shutdown) => {
-                self.begin_shutdown(ExitReason::Shutdown, ctx)
-            }
             _ => ActorTurn::Continue,
         }
+    }
+
+    fn shutdown<C: Context>(&mut self, ctx: &mut C) -> ActorTurn {
+        self.begin_shutdown(ExitReason::Shutdown, ctx)
     }
 
     fn state_version(&self) -> u64 {

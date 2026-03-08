@@ -169,7 +169,7 @@ pub enum SystemMessage {
         /// Reply channel for the control result.
         reply: mpsc::Sender<ControlResult<()>>,
     },
-    /// Shutdown initiated by the runtime or supervisor.
+    /// Shutdown initiated through the reserved control plane.
     Shutdown,
     /// Trigger a code-change hook without carrying the new state directly.
     CodeChange {

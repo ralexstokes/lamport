@@ -49,6 +49,15 @@ pub trait Actor: Send + 'static {
     /// Handles exactly one delivered envelope.
     fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn;
 
+    /// Handles a reserved control-plane shutdown request.
+    ///
+    /// The default implementation performs an orderly stop with
+    /// [`ExitReason::Shutdown`]. Higher-level adapters can override this to
+    /// surface shutdown through their own control path before exiting.
+    fn shutdown<C: Context>(&mut self, _ctx: &mut C) -> ActorTurn {
+        ActorTurn::Stop(ExitReason::Shutdown)
+    }
+
     /// Returns the actor's current control-plane state version.
     fn state_version(&self) -> u64 {
         0
