@@ -153,6 +153,13 @@ impl Mailbox {
         self.remove_first_matching(|entry| predicate(&entry.envelope))
     }
 
+    pub(crate) fn any_matching<F>(&self, mut predicate: F) -> bool
+    where
+        F: FnMut(&Envelope) -> bool,
+    {
+        self.queue.iter().any(|entry| predicate(&entry.envelope))
+    }
+
     fn remove_first_matching<F>(&mut self, predicate: F) -> Option<Envelope>
     where
         F: FnMut(&QueuedEnvelope) -> bool,

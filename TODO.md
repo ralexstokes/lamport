@@ -84,9 +84,10 @@ and code change.
     partial progress is surfaced through `LocalUpgradeError::upgraded` and is
     not rolled back automatically.
 
-- [ ] Decide whether v0 requires concurrent upgrade parity.
-  - `ConcurrentRuntime` supports actor-level control operations, but it does not
-    yet expose the same supervisor-tree/application upgrade workflow as
+- [x] Decide whether v0 requires concurrent upgrade parity.
+  - v0 now includes concurrent supervisor-tree/application upgrade parity.
+  - `ConcurrentRuntime` exposes the same leaf-to-root tree
+    quiesce/upgrade/resume workflow and partial-progress reporting as
     `LocalRuntime`.
 
 - [ ] Close the remaining control-plane test gaps.

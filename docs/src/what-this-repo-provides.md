@@ -76,7 +76,7 @@ The repo also provides the pieces needed to operate and inspect a runtime:
 - retained lifecycle events and crash reports
 - incremental event consumption with `EventCursor`
 - Prometheus text export through `export_metrics_prometheus`
-- local supervisor-tree and application upgrade transactions in `LocalRuntime`
+- supervisor-tree and application upgrade transactions in both runtime profiles
 - registered names via the runtime registry, resolved as local process
   addresses
 
@@ -86,6 +86,11 @@ the best compact tour of these APIs.
 `LocalRuntime` upgrades are resume-only on failure: the runtime resumes the
 quiesced tree before returning an error, but it does not roll back actors whose
 `CodeChange` hook already succeeded.
+
+Both `LocalRuntime` and `ConcurrentRuntime` expose actor-level control
+operations such as state inspection, state replacement, tracing, and
+single-actor `CodeChange`, and both now support coordinated tree-wide
+supervisor/application upgrades.
 
 ## Example Coverage
 
@@ -112,7 +117,6 @@ The repository examples map closely to the main building blocks:
 The current repo is deliberately scoped. It does not yet provide:
 
 - distributed node-to-node messaging
-- concurrent-runtime parity for supervisor-tree/application upgrades
 - priority mailboxes
 - durable or journaled mailboxes
 

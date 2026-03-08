@@ -1,18 +1,21 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 mod support;
 
 use lamport::{
     Actor, ActorId, ActorStatus, ActorTurn, Application, CallOutcome, CastMessage, ChildSpec,
-    Context, ControlError, Envelope, ExitReason, GenServer, LocalRuntime, LocalUpgradeFailure,
-    LocalUpgradeStage, ReplyToken, Restart, ServerOutcome, Shutdown, SpawnOptions, StartChildError,
-    Strategy, Supervisor, SupervisorDirective, SupervisorFlags, behaviour::RuntimeInfo,
-    boot_local_application, restart_scope,
+    ConcurrentRuntime, Context, ControlError, Envelope, ExitReason, GenServer, LocalRuntime,
+    LocalUpgradeFailure, LocalUpgradeStage, ReplyToken, Restart, ServerOutcome, Shutdown,
+    SpawnOptions, StartChildError, Strategy, Supervisor, SupervisorDirective, SupervisorFlags,
+    behaviour::RuntimeInfo, boot_concurrent_application, boot_local_application, restart_scope,
 };
-use support::expect_downcast;
+use support::{expect_downcast, wait_until_concurrent};
 
 const ROOT_NAME: &str = "integration.root";
 const WORKER_NAME: &str = "integration.worker";
@@ -240,6 +243,40 @@ fn supervisor_child_actor(
         .find(|child| child.spec.id == child_id)
         .and_then(|child| child.actor)
         .expect("requested child should be running")
+}
+
+fn concurrent_supervisor_child_actor(
+    runtime: &ConcurrentRuntime,
+    supervisor: ActorId,
+    child_id: &'static str,
+) -> ActorId {
+    let found = Arc::new(Mutex::new(None));
+    wait_until_concurrent(
+        runtime,
+        Duration::from_secs(1),
+        &format!("supervisor child `{child_id}` to boot"),
+        |runtime| {
+            let actor = runtime
+                .supervisor_snapshot(supervisor)
+                .and_then(|snapshot| {
+                    snapshot
+                        .children
+                        .iter()
+                        .find(|child| child.spec.id == child_id)
+                        .and_then(|child| child.actor)
+                });
+            if let Some(actor) = actor {
+                *found.lock().unwrap() = Some(actor);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    found
+        .lock()
+        .unwrap()
+        .expect("requested concurrent child should be running")
 }
 
 #[test]
@@ -738,6 +775,141 @@ fn application_upgrade_failure_keeps_prior_code_changes_and_resumes_tree() {
         .send(worker, CastMessage(UpgradeCast::Add(2)))
         .expect("post-failure cast should queue");
     runtime.run_until_idle();
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 13);
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &["worker", "branch-supervisor"]
+    );
+}
+
+#[test]
+fn concurrent_application_upgrade_quiesces_tree_and_runs_children_before_parents() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (runtime, handle) = boot_concurrent_application(
+        UpgradeApplication {
+            order: Arc::clone(&order),
+            reject_worker_upgrade: false,
+            reject_branch_upgrade: false,
+        },
+        Default::default(),
+    )
+    .expect("application should boot");
+
+    let root = handle.root_supervisor();
+    let branch = concurrent_supervisor_child_actor(&runtime, root, UPGRADE_BRANCH_CHILD);
+    let worker = concurrent_supervisor_child_actor(&runtime, branch, UPGRADE_WORKER_CHILD);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(1)))
+        .expect("queued cast should deliver");
+
+    let report = runtime.upgrade_application(handle, 1).unwrap();
+    assert_eq!(report.suspend_order, vec![root, branch, worker]);
+    assert_eq!(report.upgrade_order, vec![worker, branch, root]);
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 11);
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &["worker", "branch-supervisor", "root-supervisor"]
+    );
+}
+
+#[test]
+fn concurrent_application_upgrade_failure_resumes_tree_after_rejected_child_change() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (runtime, handle) = boot_concurrent_application(
+        UpgradeApplication {
+            order: Arc::clone(&order),
+            reject_worker_upgrade: true,
+            reject_branch_upgrade: false,
+        },
+        Default::default(),
+    )
+    .expect("application should boot");
+
+    let root = handle.root_supervisor();
+    let branch = concurrent_supervisor_child_actor(&runtime, root, UPGRADE_BRANCH_CHILD);
+    let worker = concurrent_supervisor_child_actor(&runtime, branch, UPGRADE_WORKER_CHILD);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(1)))
+        .expect("queued cast should deliver");
+
+    let error = runtime.upgrade_application(handle, 1).unwrap_err();
+    assert_eq!(error.actor, Some(worker));
+    assert_eq!(error.stage, Some(LocalUpgradeStage::CodeChange));
+    assert_eq!(error.suspended, vec![root, branch, worker]);
+    assert!(error.upgraded.is_empty());
+    assert!(matches!(
+        error.failure.as_ref(),
+        LocalUpgradeFailure::Control(ControlError::Rejected {
+            operation: "CodeChange",
+            reason,
+        }) if reason == "worker rejected the upgrade"
+    ));
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 0);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 2);
+    assert_eq!(order.lock().unwrap().as_slice(), &["worker"]);
+}
+
+#[test]
+fn concurrent_application_upgrade_failure_keeps_prior_code_changes_and_resumes_tree() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (runtime, handle) = boot_concurrent_application(
+        UpgradeApplication {
+            order: Arc::clone(&order),
+            reject_worker_upgrade: false,
+            reject_branch_upgrade: true,
+        },
+        Default::default(),
+    )
+    .expect("application should boot");
+
+    let root = handle.root_supervisor();
+    let branch = concurrent_supervisor_child_actor(&runtime, root, UPGRADE_BRANCH_CHILD);
+    let worker = concurrent_supervisor_child_actor(&runtime, branch, UPGRADE_WORKER_CHILD);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(1)))
+        .expect("queued cast should deliver");
+
+    let error = runtime.upgrade_application(handle, 1).unwrap_err();
+    assert_eq!(error.actor, Some(branch));
+    assert_eq!(error.stage, Some(LocalUpgradeStage::CodeChange));
+    assert_eq!(error.suspended, vec![root, branch, worker]);
+    assert_eq!(error.upgraded, vec![worker]);
+    assert!(matches!(
+        error.failure.as_ref(),
+        LocalUpgradeFailure::Control(ControlError::Rejected {
+            operation: "CodeChange",
+            reason,
+        }) if reason == "branch supervisor rejected the upgrade"
+    ));
+
+    let snapshot = runtime.get_state(worker).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 11);
+
+    runtime
+        .send(worker, CastMessage(UpgradeCast::Add(2)))
+        .expect("post-failure cast should queue");
+    wait_until_concurrent(
+        &runtime,
+        Duration::from_secs(1),
+        "post-upgrade cast to deliver on concurrent runtime",
+        |runtime| {
+            runtime.get_state(worker).is_ok_and(|snapshot| {
+                snapshot.version == 1 && snapshot.payload.downcast::<usize>().ok() == Some(13)
+            })
+        },
+    );
 
     let snapshot = runtime.get_state(worker).unwrap();
     assert_eq!(snapshot.version, 1);
