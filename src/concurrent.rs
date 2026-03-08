@@ -3551,6 +3551,158 @@ mod tests {
     }
 
     #[test]
+    fn managed_shutdown_uses_runtime_reserve_when_user_capacity_is_full() {
+        let runtime = ConcurrentRuntime::new(SchedulerConfig {
+            default_mailbox_capacity: 2,
+            mailbox_runtime_reserve: 1,
+            ..SchedulerConfig::default()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = runtime
+            .spawn(ShutdownPriorityActor {
+                seen: Arc::clone(&seen),
+            })
+            .unwrap();
+
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        {
+            let mut state = runtime.inner.lock_state();
+            let entry = super::RuntimeShared::actor_mut(&mut state, actor).unwrap();
+            assert_eq!(super::push_envelope(entry, Envelope::user(1_u32)), Ok(()));
+            assert_eq!(
+                super::push_envelope(entry, Envelope::user(2_u32)),
+                Err(SendError::MailboxFull { actor, capacity: 2 })
+            );
+        }
+
+        runtime.shutdown_actor(actor, Shutdown::Infinity).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if runtime.actor_snapshot(actor).unwrap().status == ActorStatus::Dead {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.starts_with("user:"))
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Shutdown));
+    }
+
+    #[test]
+    fn managed_shutdown_still_succeeds_when_runtime_reserve_is_exhausted() {
+        let runtime = ConcurrentRuntime::new(SchedulerConfig {
+            default_mailbox_capacity: 2,
+            mailbox_runtime_reserve: 1,
+            ..SchedulerConfig::default()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = runtime
+            .spawn(ShutdownPriorityActor {
+                seen: Arc::clone(&seen),
+            })
+            .unwrap();
+
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        {
+            let mut state = runtime.inner.lock_state();
+            let entry = super::RuntimeShared::actor_mut(&mut state, actor).unwrap();
+            assert_eq!(super::push_envelope(entry, Envelope::user(1_u32)), Ok(()));
+            assert_eq!(
+                super::push_envelope(entry, Envelope::System(SystemMessage::Suspend)),
+                Ok(())
+            );
+            assert_eq!(entry.mailbox.len(), 2);
+        }
+
+        runtime.shutdown_actor(actor, Shutdown::Infinity).unwrap();
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.starts_with("user:"))
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Shutdown));
+    }
+
+    #[test]
+    fn repeated_managed_shutdown_cancels_stale_timeout_under_mailbox_pressure() {
+        let runtime = ConcurrentRuntime::new(SchedulerConfig {
+            default_mailbox_capacity: 2,
+            mailbox_runtime_reserve: 1,
+            ..SchedulerConfig::default()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = runtime
+            .spawn_with_options(
+                SuspendAwareActor {
+                    seen: Arc::clone(&seen),
+                },
+                SpawnOptions {
+                    trap_exit: true,
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        {
+            let mut state = runtime.inner.lock_state();
+            let entry = super::RuntimeShared::actor_mut(&mut state, actor).unwrap();
+            assert_eq!(super::push_envelope(entry, Envelope::user(1_u32)), Ok(()));
+        }
+
+        runtime
+            .shutdown_actor(actor, Shutdown::Timeout(Duration::from_millis(50)))
+            .unwrap();
+        runtime.shutdown_actor(actor, Shutdown::BrutalKill).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if runtime.actor_snapshot(actor).unwrap().status == ActorStatus::Dead {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Kill));
+
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(runtime.wait_for_idle(Some(Duration::from_secs(1))));
+        assert!(!runtime.lifecycle_events().iter().any(|event| {
+            matches!(
+                event,
+                LifecycleEvent::Shutdown {
+                    actor: shutdown_actor,
+                    phase: crate::lifecycle::ShutdownPhase::TimedOut,
+                    ..
+                } if *shutdown_actor == actor
+            )
+        }));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.starts_with("exit:"))
+                .count()
+                <= 1
+        );
+    }
+
+    #[test]
     fn code_change_bypasses_selective_receive_with_pending_call() {
         let runtime = ConcurrentRuntime::default();
         let seen = Arc::new(Mutex::new(Vec::new()));

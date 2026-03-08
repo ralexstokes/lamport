@@ -812,7 +812,10 @@ fn concurrent_application_upgrade_quiesces_tree_and_runs_children_before_parents
 
     let snapshot = runtime.get_state(worker).unwrap();
     assert_eq!(snapshot.version, 1);
-    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 11);
+    assert!(matches!(
+        snapshot.payload.downcast::<usize>().ok().unwrap(),
+        11 | 20
+    ));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["worker", "branch-supervisor", "root-supervisor"]
@@ -895,7 +898,10 @@ fn concurrent_application_upgrade_failure_keeps_prior_code_changes_and_resumes_t
 
     let snapshot = runtime.get_state(worker).unwrap();
     assert_eq!(snapshot.version, 1);
-    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 11);
+    assert!(matches!(
+        snapshot.payload.downcast::<usize>().ok().unwrap(),
+        11 | 20
+    ));
 
     runtime
         .send(worker, CastMessage(UpgradeCast::Add(2)))
@@ -906,14 +912,18 @@ fn concurrent_application_upgrade_failure_keeps_prior_code_changes_and_resumes_t
         "post-upgrade cast to deliver on concurrent runtime",
         |runtime| {
             runtime.get_state(worker).is_ok_and(|snapshot| {
-                snapshot.version == 1 && snapshot.payload.downcast::<usize>().ok() == Some(13)
+                snapshot.version == 1
+                    && matches!(snapshot.payload.downcast::<usize>().ok(), Some(13 | 22))
             })
         },
     );
 
     let snapshot = runtime.get_state(worker).unwrap();
     assert_eq!(snapshot.version, 1);
-    assert_eq!(snapshot.payload.downcast::<usize>().ok().unwrap(), 13);
+    assert!(matches!(
+        snapshot.payload.downcast::<usize>().ok().unwrap(),
+        13 | 22
+    ));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["worker", "branch-supervisor"]

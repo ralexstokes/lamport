@@ -176,7 +176,7 @@ failure handling stays predictable under mailbox pressure and shutdown races.
   - Runtime-originated overflow, cleanup after crash/shutdown, and
     completed-snapshot lookup after death are covered.
 
-- [ ] Add a few more adversarial tests around managed shutdown plus mailbox
+- [x] Add a few more adversarial tests around managed shutdown plus mailbox
   pressure to finish the edge-case matrix.
 
 Why this matters:
