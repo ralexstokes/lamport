@@ -178,10 +178,10 @@ impl LocalRuntime {
                 registered_name,
                 parent,
                 parent_context,
-                ancestors: ancestors.clone(),
+                ancestors,
                 ancestor_contexts,
                 supervisor_child,
-                reason: final_reason.clone(),
+                reason: final_reason,
             });
         }
 

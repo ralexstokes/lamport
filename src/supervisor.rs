@@ -367,17 +367,16 @@ impl<S: Supervisor> SupervisorActor<S> {
             return self.request_shutdown(plan, next_child, ctx);
         }
 
-        ActorTurn::Stop(plan.final_reason.clone())
+        ActorTurn::Stop(plan.final_reason)
     }
 
     fn request_shutdown<C: Context>(
         &mut self,
-        plan: ShutdownPlan,
+        mut plan: ShutdownPlan,
         child_id: &'static str,
         ctx: &mut C,
     ) -> ActorTurn {
         let Some(actor) = self.state.running_actor(child_id) else {
-            let mut plan = plan;
             plan.active_child = None;
             return self.advance_shutdown(plan, child_id, ctx);
         };
@@ -390,7 +389,6 @@ impl<S: Supervisor> SupervisorActor<S> {
 
         if ctx.shutdown_actor(actor, spec.shutdown).is_err() {
             self.state.forget_child_actor(actor);
-            let mut plan = plan;
             plan.active_child = None;
             return self.advance_shutdown(plan, child_id, ctx);
         }

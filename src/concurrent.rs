@@ -539,18 +539,15 @@ impl RuntimeShared {
 
     fn cancel_call_timeout(&self, actor: ActorId, reference: Ref) -> bool {
         let mut cancelled = false;
-        let handle = {
-            let mut state = self.lock_state();
-            Self::actor_mut(&mut state, actor)
-                .and_then(|entry| entry.call_timeout_tasks.remove(&reference))
-        };
+        let mut state = self.lock_state();
 
-        if let Some(handle) = handle {
+        if let Some(handle) = Self::actor_mut(&mut state, actor)
+            .and_then(|entry| entry.call_timeout_tasks.remove(&reference))
+        {
             handle.abort();
             cancelled = true;
         }
 
-        let mut state = self.lock_state();
         if let Some(entry) = Self::actor_mut(&mut state, actor) {
             let removed = entry
                 .mailbox

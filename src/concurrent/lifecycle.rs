@@ -1,6 +1,6 @@
 use crate::{
     envelope::{DownMessage, Envelope, ExitSignal},
-    internal::{classify_exit_signal, shutdown_link_reason},
+    internal::{ExitDisposition, classify_exit_signal, shutdown_link_reason},
     lifecycle::{CrashReport, LifecycleEvent, ShutdownPhase},
     types::{ActorId, ActorStatus, ExitReason},
 };
@@ -19,11 +19,11 @@ impl RuntimeShared {
         };
 
         match classify_exit_signal(trap_exit, &signal) {
-            crate::internal::ExitDisposition::KillNow => {
+            ExitDisposition::KillNow => {
                 self.request_force_exit(target, signal.reason);
             }
-            crate::internal::ExitDisposition::Ignore => {}
-            crate::internal::ExitDisposition::Enqueue => {
+            ExitDisposition::Ignore => {}
+            ExitDisposition::Enqueue => {
                 let _ = self.enqueue_runtime_envelope(target, Envelope::Exit(signal), "exit");
             }
         }
@@ -132,10 +132,10 @@ impl RuntimeShared {
                     CrashReport {
                         actor,
                         name,
-                        registered_name: registered_name.clone(),
+                        registered_name,
                         parent,
                         parent_context,
-                        ancestors: ancestors.clone(),
+                        ancestors,
                         ancestor_contexts,
                         supervisor_child,
                         reason: final_reason.clone(),
