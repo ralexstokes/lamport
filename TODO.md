@@ -17,14 +17,14 @@ cluster protocol yet.
 
 ### 1.1 Harden Local Identity And Addressing
 
-- Make generation-bearing actor ids fully real, including safe slot reuse and
-  stale-handle rejection.
-- Tighten `Ref` semantics so request refs, monitor refs, timer refs, and task
-  refs have one obvious lifecycle and uniqueness story.
-- Introduce a process-address abstraction that still points only to local
+- [x] Make generation-bearing actor ids fully real, including safe slot reuse
+  and stale-handle rejection.
+- [x] Tighten `Ref` semantics so request refs, monitor refs, timer refs, and
+  task refs have one obvious lifecycle and uniqueness story.
+- [x] Introduce a process-address abstraction that still points only to local
   actors for now, but avoids baking "always local" assumptions into every API.
-- Keep the registry explicitly local and fast; do not mix in distributed naming
-  semantics yet.
+- [x] Keep the registry explicitly local and fast; do not mix in distributed
+  naming semantics yet.
 
 Why this matters:
 
@@ -38,38 +38,37 @@ Goal: turn the currently reserved system/control surface into an explicit,
 runtime-owned local protocol for inspection, coordination, tracing, shutdown,
 and code change.
 
-- Define which messages are true system messages.
+- [x] Define the reserved system/control message set.
   - `Suspend`, `Resume`, `GetState`, `ReplaceState`, `TraceOn`, `TraceOff`,
-    `Shutdown`, and `CodeChange` need runtime-level semantics rather than
-    "just another enum variant".
-  - Decide which of these bypass normal user backpressure and whether they have
-    priority over user mail.
+    `Shutdown`, and `CodeChange` exist as reserved message kinds.
+  - Runtime-originated traffic uses the mailbox reserve and bypass path instead
+    of ordinary user admission rules.
 
-- Add a real system-message path.
-  - Deliver control messages through a reserved lane or explicit priority path.
-  - Prevent user traffic from indefinitely starving suspend/shutdown/control
-    operations.
-  - Make the behavior consistent in both local and concurrent runtimes.
+- [x] Add a real system-message path.
+  - Control messages are delivered through the reserved runtime lane.
+  - User traffic cannot indefinitely starve suspend/resume/state/trace/code
+    change operations.
+  - Local and concurrent runtimes use the same priority story.
 
-- Implement suspend/resume semantics.
-  - Suspending a process should stop normal message execution without losing
+- [x] Implement suspend/resume semantics.
+  - Suspending a process stops normal user-message execution without losing
     mailbox contents.
-  - Define whether exits, downs, and other critical signals still flow while
-    suspended.
-  - Decide how a supervisor behaves when a child is suspended.
+  - Exit and down signals still flow while suspended.
 
-- Implement process inspection and local state extraction.
-  - `GetState` should have a well-defined reply shape and failure mode for
-    actors that cannot or will not expose state.
-  - Tracing should be explicit about what gets recorded: receives, sends,
-    lifecycle events, scheduler assignment, mailbox depth, or all of the above.
+- [x] Implement process inspection and local state extraction.
+  - `GetState` has a concrete reply shape and explicit unsupported/rejected
+    failure modes.
+  - Actor-scoped tracing can record receives, sends, mailbox depth, and
+    scheduler assignment.
 
-- Implement controlled state replacement and code change.
-  - `ReplaceState` should validate the replacement payload and fail closed.
-  - `CodeChange` should call the reserved behavior hooks through a real runtime
-    flow, not an ad hoc manual call.
-  - State migration needs versioning so code upgrades can reject incompatible
-    state cleanly.
+- [x] Implement controlled state replacement and code change.
+  - `ReplaceState` validates payload shape and version.
+  - `CodeChange` runs through the reserved runtime path.
+  - State migration is versioned and can reject incompatible upgrades cleanly.
+
+- [x] Add a real local upgrade workflow for `LocalRuntime`.
+  - Supervisor-tree and application upgrades quiesce, run leaf-to-root code
+    change, and resume the tree on success or failure.
 
 - [x] Unify the shutdown story completely.
   - `shutdown_actor` and reserved `SystemMessage::Shutdown` now converge on the
@@ -78,17 +77,23 @@ and code change.
     coordinated subtree shutdown, and typed behaviors still see shutdown via
     their `info` path.
 
-- Add a real local upgrade workflow.
-  - `CodeChange` is only the actor-local hook; the runtime still needs an
-    upgrade story for supervisor trees and applications.
-  - Define quiescing, upgrade ordering, failure handling, and rollback or
-    restart behavior when one step of a local upgrade rejects or crashes.
-  - Decide how upgrade orchestration interacts with suspend/resume, pending
-    calls, and actor-selected receive loops.
+- [ ] Decide and document partial-upgrade failure semantics.
+  - The local upgrade path resumes the tree after failure, but it does not
+    currently roll back actors whose `CodeChange` already succeeded.
+  - Choose whether v0 means resume-only, rollback, or subtree restart after a
+    rejected/crashed upgrade step.
 
-- Add control-plane observability and tests.
-  - Test suspend/resume under load, shutdown during mailbox pressure, code
-    change during pending calls, and tracing overhead.
+- [ ] Decide whether v0 requires concurrent upgrade parity.
+  - `ConcurrentRuntime` supports actor-level control operations, but it does not
+    yet expose the same supervisor-tree/application upgrade workflow as
+    `LocalRuntime`.
+
+- [ ] Close the remaining control-plane test gaps.
+  - Add focused coverage for shutdown under mailbox pressure.
+  - Add focused coverage for code change while pending calls or selective
+    receive loops are active.
+  - Add focused coverage for supervisor behavior around suspended children and
+    tracing overhead.
 
 Why this matters:
 
@@ -103,47 +108,40 @@ Goal: let an actor decide what it is waiting for, scan its mailbox selectively,
 and block until a matching message or timeout arrives, instead of always being
 handed the next envelope by the runtime.
 
-- Introduce a receive-oriented runtime API.
-  - Add process-side operations for "receive next", selective receive, and
-    selective receive after watermark.
-  - Preserve the ability to express timeouts without forcing every caller to
-    build its own timer protocol.
-  - Keep the API usable from both raw actors and higher-level behaviors.
+- [x] Introduce a receive-oriented runtime API.
+  - Actors can `receive_next`, selectively receive, selectively receive after a
+    watermark, and use runtime-managed receive timeouts.
+  - The API is usable from both raw actors and higher-level behaviors.
 
-- Move mailbox choice closer to the actor.
-  - Today the runtime pops one envelope and invokes `handle`.
-  - A receive-oriented model means the actor participates in choosing which
-    queued message to consume next.
-  - That likely requires changing the low-level actor contract, not just adding
-    helper methods to `Context`.
+- [x] Move mailbox choice closer to the actor.
+  - The low-level actor contract now lets an actor choose its next envelope via
+    `select_envelope`.
 
-- Define unmatched-message behavior.
-  - Selective receive needs a save-queue or equivalent policy so unmatched
-    messages are preserved in order.
-  - Document the performance cost of mailbox scanning and the fairness tradeoff
-    under large mailboxes.
+- [x] Define unmatched-message behavior.
+  - Selective receive preserves unmatched relative order.
+  - Watermark-based receive ignores older messages even if they match later.
 
-- Specify interaction with system traffic.
-  - Decide whether system/control messages bypass user selective receive,
-    interleave with it, or are exposed through a separate receive path.
-  - Exit, down, and shutdown signals must not become unobservable because user
-    code is waiting for a different payload shape.
+- [x] Specify interaction with system traffic.
+  - System/control, exit, and down traffic bypasses user selective receive so
+    those signals remain observable.
 
-- Reconcile receive semantics with typed behaviors.
-  - `GenServer` and `GenStatem` can stay structured APIs, but their
-    implementations need to coexist with raw selective receive.
-  - Pending-call reply correlation should be expressible as a receive pattern
-    rather than a side-channel abstraction only.
+- [x] Reconcile receive semantics with typed behaviors.
+  - Typed behavior adapters coexist with the same mailbox and runtime envelope
+    model.
+  - Pending-call reply correlation is expressible via reply refs plus mailbox
+    watermarks.
 
-- Revisit scheduler and mailbox invariants.
-  - A receive loop can stay single-process-serialized, but it changes how long
-    a process may hold control while scanning or waiting.
-  - The runtime needs clear yield points so one process cannot monopolize a
-    scheduler by repeated mailbox scans.
+- [x] Revisit scheduler and mailbox invariants enough for v0.
+  - Per-actor execution remains single-process-serialized.
+  - The API documents yielding in repeated scan/wait loops so concurrent
+    schedulers can rotate fairly.
 
-- Add thorough tests.
-  - Cover watermark-based selective receive, timeout races, late replies, exit
-    delivery while waiting, and fairness under mailbox growth.
+- [x] Add core receive tests.
+  - Watermark-based selective receive, timeout races, late replies, and
+    exit/down delivery while waiting are covered.
+
+- [ ] Add heavier fairness/performance characterization if mailbox scanning
+  under large queues becomes a practical issue.
 
 Why this matters:
 
@@ -157,30 +155,27 @@ Why this matters:
 Goal: make runtime-owned traffic and actor teardown semantics explicit so local
 failure handling stays predictable under mailbox pressure and shutdown races.
 
-- Make mailbox reserve semantics explicit for all runtime-originated traffic.
-  - The reserve should apply not just to system messages, but also to replies,
-    task completions, call timeouts, exit signals, down notifications, and
-    timer events.
-  - Document the failure path when even the reserved capacity is exhausted
-    during runtime-owned delivery.
+- [x] Make mailbox reserve semantics explicit for runtime-originated traffic.
+  - The reserve applies to replies, task completions, call timeouts, exit
+    signals, down notifications, timer events, and system messages.
 
-- Define runtime-originated overflow handling.
-  - If reply, timeout, exit, down, timer, task, or system delivery still cannot
-    be queued, the runtime should fail in one well-defined way rather than
-    silently dropping or inconsistently retrying.
-  - Make the behavior consistent in both local and concurrent runtimes.
+- [x] Define runtime-originated overflow handling.
+  - If runtime-owned delivery cannot be queued even after reserve handling, the
+    target actor fails in one explicit way instead of dropping traffic.
+  - Local and concurrent runtimes follow the same rule.
 
-- Tighten actor finalization guarantees.
-  - Define exactly what cleanup runs on exit: terminate hook invocation, timer
-    and call-timeout cancellation, link detachment, monitor notification,
-    registry cleanup, supervisor-child bookkeeping, and completed-snapshot
-    retention.
-  - Clarify which of those guarantees still hold after panic paths or forced
-    exit.
+- [x] Tighten actor finalization guarantees.
+  - Exit runs the terminate hook, cancels timers and call timeouts, detaches
+    links, notifies monitors, cleans registry and supervisor-child bookkeeping,
+    and retains a completed snapshot.
+  - Dead snapshots remain queryable by actor id.
 
-- Add teardown and overflow tests.
-  - Cover runtime-originated delivery into nearly full mailboxes, cleanup after
-    shutdown and crash, and completed-snapshot lookup after death.
+- [x] Add core teardown and overflow tests.
+  - Runtime-originated overflow, cleanup after crash/shutdown, and
+    completed-snapshot lookup after death are covered.
+
+- [ ] Add a few more adversarial tests around managed shutdown plus mailbox
+  pressure to finish the edge-case matrix.
 
 Why this matters:
 
