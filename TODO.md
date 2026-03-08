@@ -90,7 +90,7 @@ and code change.
     quiesce/upgrade/resume workflow and partial-progress reporting as
     `LocalRuntime`.
 
-- [ ] Close the remaining control-plane test gaps.
+- [x] Close the remaining control-plane test gaps.
   - Add focused coverage for shutdown under mailbox pressure.
   - Add focused coverage for code change while pending calls or selective
     receive loops are active.

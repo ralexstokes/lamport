@@ -2543,6 +2543,124 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GateControl {
+        Release,
+    }
+
+    struct GatedReplyActor {
+        pending: Option<ReplyToken>,
+    }
+
+    impl Actor for GatedReplyActor {
+        fn handle<C: Context>(&mut self, envelope: Envelope, ctx: &mut C) -> ActorTurn {
+            match envelope {
+                Envelope::Request { token, .. } => {
+                    self.pending = Some(token);
+                }
+                Envelope::User(payload)
+                    if payload.downcast_ref::<GateControl>() == Some(&GateControl::Release) =>
+                {
+                    if let Some(token) = self.pending.take() {
+                        let _ = ctx.reply(token, 42_u32);
+                    }
+                }
+                other => panic!("unexpected envelope: {other:?}"),
+            }
+
+            ActorTurn::Continue
+        }
+    }
+
+    struct CodeChangeWaitingActor {
+        server: crate::ActorId,
+        seen: Arc<Mutex<Vec<String>>>,
+        pending: Option<crate::PendingCall>,
+        version: u64,
+    }
+
+    impl Actor for CodeChangeWaitingActor {
+        fn init<C: Context>(&mut self, ctx: &mut C) -> Result<(), ExitReason> {
+            self.pending = Some(
+                ctx.ask(self.server, 41_u32, None)
+                    .map_err(|error| ExitReason::Error(format!("ask failed: {error:?}")))?,
+            );
+            ctx.send(ctx.actor_id(), 7_u32)
+                .map_err(|error| ExitReason::Error(format!("self-send failed: {error:?}")))?;
+            Ok(())
+        }
+
+        fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+            if let Some(pending) = self.pending {
+                return ctx.receive_selective_after(pending.mailbox_watermark, |envelope| {
+                    matches!(
+                        envelope,
+                        Envelope::Reply { reference, .. } if *reference == pending.reference
+                    ) || matches!(
+                        envelope,
+                        Envelope::CallTimeout(timeout) if timeout.reference == pending.reference
+                    )
+                });
+            }
+
+            ctx.receive_next()
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            let label = match envelope {
+                Envelope::Reply { reference, message } => {
+                    assert_eq!(
+                        Some(reference),
+                        self.pending.map(|pending| pending.reference)
+                    );
+                    self.pending = None;
+                    format!(
+                        "reply:v{}:{}",
+                        self.version,
+                        message.downcast::<u32>().ok().unwrap()
+                    )
+                }
+                Envelope::User(payload) => {
+                    format!(
+                        "user:v{}:{}",
+                        self.version,
+                        payload.downcast::<u32>().ok().unwrap()
+                    )
+                }
+                other => panic!("unexpected envelope: {other:?}"),
+            };
+
+            self.seen.lock().unwrap().push(label);
+            ActorTurn::Continue
+        }
+
+        fn state_version(&self) -> u64 {
+            self.version
+        }
+
+        fn inspect_state<C: Context>(
+            &mut self,
+            _ctx: &mut C,
+        ) -> Result<StateSnapshot, ControlError> {
+            Ok(StateSnapshot::new(self.version, self.version))
+        }
+
+        fn code_change<C: Context>(
+            &mut self,
+            target_version: u64,
+            _ctx: &mut C,
+        ) -> Result<(), ControlError> {
+            match (self.version, target_version) {
+                (current, requested) if current == requested => Ok(()),
+                (0, 1) => {
+                    self.version = 1;
+                    Ok(())
+                }
+                (current, requested) => Err(ControlError::VersionMismatch { current, requested }),
+            }
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum ReceiveTimeoutMode {
         MatchBeforeTimeout,
@@ -2685,6 +2803,39 @@ mod tests {
             };
             self.seen.lock().unwrap().push(label);
             ActorTurn::Continue
+        }
+    }
+
+    struct ShutdownPriorityActor {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Actor for ShutdownPriorityActor {
+        fn select_envelope<C: Context>(&mut self, ctx: &mut C) -> Option<ReceivedEnvelope> {
+            ctx.receive_selective(|envelope| {
+                matches!(
+                    envelope,
+                    Envelope::User(payload) if payload.downcast_ref::<u32>() == Some(&99_u32)
+                )
+            })
+        }
+
+        fn handle<C: Context>(&mut self, envelope: Envelope, _ctx: &mut C) -> ActorTurn {
+            match envelope {
+                Envelope::User(payload) => self
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("user:{}", payload.downcast::<u32>().ok().unwrap())),
+                other => panic!("unexpected envelope: {other:?}"),
+            }
+
+            ActorTurn::Continue
+        }
+
+        fn shutdown<C: Context>(&mut self, _ctx: &mut C) -> ActorTurn {
+            self.seen.lock().unwrap().push("shutdown".into());
+            ActorTurn::Stop(ExitReason::Shutdown)
         }
     }
 
@@ -2985,6 +3136,73 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_bypasses_selective_receive_with_backlogged_mailbox() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn(ShutdownPriorityActor {
+                seen: Arc::clone(&seen),
+            })
+            .unwrap();
+
+        runtime.run_until_idle();
+        runtime.send(actor, 1_u32).unwrap();
+        runtime.send(actor, 2_u32).unwrap();
+        runtime.run_until_idle();
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Waiting);
+        assert_eq!(snapshot.metrics.mailbox_len, 2);
+
+        runtime.shutdown_actor(actor, Shutdown::Infinity).unwrap();
+        runtime.run_until_idle();
+
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.starts_with("user:"))
+        );
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Dead);
+        assert_eq!(snapshot.metrics.last_exit, Some(ExitReason::Shutdown));
+    }
+
+    #[test]
+    fn code_change_bypasses_selective_receive_with_pending_call() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = LocalRuntime::default();
+        let server = runtime.spawn(GatedReplyActor { pending: None }).unwrap();
+        let actor = runtime
+            .spawn(CodeChangeWaitingActor {
+                server,
+                seen: Arc::clone(&seen),
+                pending: None,
+                version: 0,
+            })
+            .unwrap();
+
+        runtime.run_until_idle();
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert_eq!(snapshot.status, crate::ActorStatus::Waiting);
+        assert_eq!(snapshot.metrics.mailbox_len, 1);
+
+        runtime.code_change_actor(actor, 1).unwrap();
+        let state = runtime.get_state(actor).unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.payload.downcast::<u64>().ok().unwrap(), 1);
+
+        runtime.send(server, GateControl::Release).unwrap();
+        runtime.run_until_idle();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["reply:v1:42", "user:v1:7"]
+        );
+    }
+
+    #[test]
     fn selective_receive_still_delivers_link_exit_signals() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = LocalRuntime::default();
@@ -3112,6 +3330,56 @@ mod tests {
         let snapshot = runtime.actor_snapshot(actor).unwrap();
         assert!(snapshot.suspended);
         assert_eq!(snapshot.metrics.mailbox_len, 1);
+    }
+
+    #[test]
+    fn trace_options_all_capture_mailbox_depth_and_scheduler_metadata() {
+        let mut runtime = LocalRuntime::default();
+        let actor = runtime
+            .spawn(ControlledActor {
+                value: 0,
+                version: 0,
+            })
+            .unwrap();
+
+        runtime.run_until_idle();
+        runtime.suspend_actor(actor).unwrap();
+        runtime.run_until_idle();
+        runtime.trace_actor(actor, TraceOptions::all()).unwrap();
+        runtime.send(actor, 1_i32).unwrap();
+        runtime.send(actor, 2_i32).unwrap();
+
+        let snapshot = runtime.actor_snapshot(actor).unwrap();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.metrics.mailbox_len, 2);
+
+        runtime.resume_actor(actor).unwrap();
+        runtime.run_until_idle();
+
+        let state = runtime.get_state(actor).unwrap();
+        assert_eq!(state.payload.downcast::<i32>().ok().unwrap(), 3);
+
+        let events = runtime.event_log();
+        let received = events.iter().filter_map(|event| match &event.kind {
+            RuntimeEventKind::Trace(trace)
+                if trace.actor == actor
+                    && matches!(
+                        trace.kind,
+                        TraceEventKind::Received {
+                            envelope_kind: crate::EnvelopeKind::User,
+                        }
+                    ) =>
+            {
+                Some(trace)
+            }
+            _ => None,
+        });
+        assert!(received.into_iter().any(|trace| {
+            trace
+                .mailbox_len
+                .is_some_and(|mailbox_len| mailbox_len >= 1)
+                && trace.scheduler_id == Some(0)
+        }));
     }
 
     #[test]

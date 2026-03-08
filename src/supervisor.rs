@@ -1086,6 +1086,80 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_shutdown_completes_with_suspended_children() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let modes = BTreeMap::from([
+            ("a", WorkerMode::Immediate),
+            ("b", WorkerMode::Immediate),
+            ("c", WorkerMode::Immediate),
+        ]);
+        let mut runtime = LocalRuntime::default();
+        let supervisor = runtime
+            .spawn(SupervisorActor::new(test_supervisor(
+                Strategy::OneForOne,
+                3,
+                default_specs(),
+                modes,
+                log,
+            )))
+            .unwrap();
+
+        runtime.run_until_idle();
+        let before = child_ids(&mut runtime, supervisor);
+        runtime.suspend_actor(before["b"]).unwrap();
+        runtime.run_until_idle();
+
+        let snapshot = runtime.actor_snapshot(before["b"]).unwrap();
+        assert!(snapshot.suspended);
+
+        runtime
+            .send_envelope(supervisor, Envelope::System(SystemMessage::Shutdown))
+            .unwrap();
+        runtime.run_until_idle();
+        wait_until_dead(&mut runtime, supervisor);
+
+        let requested: Vec<_> = runtime
+            .lifecycle_events()
+            .iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::Shutdown {
+                    phase: crate::ShutdownPhase::Requested,
+                    actor,
+                    ..
+                } if *actor != supervisor => Some(*actor),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(requested, vec![before["c"], before["b"], before["a"]]);
+        assert!(runtime.lifecycle_events().iter().all(|event| {
+            !matches!(
+                event,
+                LifecycleEvent::Shutdown {
+                    actor,
+                    phase: crate::ShutdownPhase::TimedOut,
+                    ..
+                } if *actor == before["b"]
+            )
+        }));
+
+        for actor in before.values() {
+            assert_eq!(
+                runtime.actor_snapshot(*actor).unwrap().status,
+                ActorStatus::Dead
+            );
+        }
+        assert_eq!(
+            runtime
+                .actor_snapshot(supervisor)
+                .unwrap()
+                .metrics
+                .last_exit,
+            Some(ExitReason::Shutdown)
+        );
+    }
+
+    #[test]
     fn restart_intensity_limit_shuts_down_supervisor() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let modes = BTreeMap::from([
