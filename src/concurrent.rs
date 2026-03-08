@@ -298,10 +298,10 @@ impl RuntimeShared {
         let registered_name = actor.registered_name.clone();
         let name = actor.name;
 
-        if let Some(name) = actor.registered_name.clone() {
+        if let Some(ref name) = registered_name {
             state
                 .registry
-                .register(actor.id, name)
+                .register(actor.id, name.clone())
                 .map_err(SpawnError::Registry)?;
         }
 
@@ -445,10 +445,6 @@ impl RuntimeShared {
         actor: ActorId,
         policy: Shutdown,
     ) -> Result<(), SendError> {
-        if !self.contains(actor) {
-            return Err(SendError::NoProc(actor));
-        }
-
         {
             let mut state = self.lock_state();
             if !Self::actor_matches(&state, actor) {
@@ -538,11 +534,7 @@ impl RuntimeShared {
             self.idle_cv.notify_all();
         }
 
-        if cancelled {
-            return true;
-        }
-
-        false
+        cancelled
     }
 
     fn cancel_call_timeout(&self, actor: ActorId, reference: Ref) -> bool {

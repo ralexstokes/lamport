@@ -1557,9 +1557,9 @@ impl LocalRuntime {
         let supervisor_child = entry.state.supervisor_child;
         let name = entry.name;
 
-        if let Some(name) = entry.state.registered_name.clone() {
+        if let Some(ref name) = registered_name {
             self.registry
-                .register(entry.state.id, name)
+                .register(entry.state.id, name.clone())
                 .map_err(SpawnError::Registry)?;
         }
 
